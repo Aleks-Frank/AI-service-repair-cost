@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "AI-Сметчик",
+    "slug": "ai-smetchik",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "bundler": "metro",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "output": "single"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Доступ нужен, чтобы прикрепить фото дефекта к заявке.",
+          "cameraPermission": "Доступ нужен, чтобы сфотографировать дефект."
+        }
+      ],
+      "expo-image"
+    ]
+  }
+}
