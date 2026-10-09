@@ -1,0 +1,70 @@
+# Инфраструктура RAG-модуля AI-сметчика.
+#   db — PostgreSQL 17 + pgvector, база pzr_pricing (расценки ПЗР и их векторы);
+#   ml — ML-сервис: модели эмбеддингов и переранжирования (/embed, /rerank, /health).
+#
+# Запуск:    docker compose up -d --build     (первая сборка образа ml — ~3 ГБ загрузки)
+# Остановка: docker compose down             (данные БД сохраняются в volume pgdata)
+
+# Имя группы контейнеров в Docker Desktop (по умолчанию было бы имя папки).
+name: ai-smetchik
+
+services:
+  db:
+    # Официальный образ проекта pgvector: обычный Postgres со встроенным расширением vector.
+    image: pgvector/pgvector:pg17
+    container_name: pzr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smeta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smeta}
+      POSTGRES_DB: ${POSTGRES_DB:-pzr_pricing}
+    ports:
+      # Только localhost: снаружи машины база недоступна.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ml:
+    build:
+      context: .
+      dockerfile: ml_service/Dockerfile
+    container_name: pzr-ml
+    restart: unless-stopped
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      DEVICE: ${DEVICE:-auto}
+      # Кэш Hugging Face внутри контейнера — смонтирован с хоста (см. volumes).
+      HF_HOME: /hf-cache
+    # Запускаем от имени обычного пользователя, чтобы файлы в кэше на хосте
+    # не становились собственностью root.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      # Веса моделей (~4,5 ГБ) берутся из кэша на хосте: скачиваются один раз
+      # и переживают пересборку образа.
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/hf-cache
+    ports:
+      - "127.0.0.1:${ML_PORT:-8001}:8000"
+    deploy:
+      resources:
+        reservations:
+          # Доступ к видеокарте (нужен NVIDIA Container Toolkit; в Docker Desktop под WSL он встроен).
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Загрузка моделей занимает до пары минут — в это время проверки не считаются провалом.
+      start_period: 180s
+
+volumes:
+  pgdata:
