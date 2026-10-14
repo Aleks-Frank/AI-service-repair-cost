@@ -1,0 +1,11 @@
+{
+  "event": "ONCRMDEALADD",
+  "data": {
+    "FIELDS": {"ID": "42"}
+  },
+  "ts": "1791500000",
+  "auth": {
+    "domain": "your-portal.bitrix24.ru",
+    "application_token": "REPLACE_WITH_BITRIX_OUTBOUND_TOKEN_FROM_ENV"
+  }
+}
