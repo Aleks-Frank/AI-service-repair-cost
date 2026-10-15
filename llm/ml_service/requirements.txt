@@ -1,0 +1,4 @@
+# Зависимости ML-сервиса (torch ставится отдельно в Dockerfile — с индекса PyTorch).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sentence-transformers>=3.0
