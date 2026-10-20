@@ -8,7 +8,7 @@ LLM на первом этапе для каждого дефекта форму
 
 from rag.db import Rate
 from rag.retriever import HybridRetriever
-from estimator.schemas import Observations, Selection, WorkChoice
+from llm.estimator.schemas import Observations, Selection, WorkChoice
 
 # Минимальная оценка reranker'а, при которой «работа без расценки» сопоставляется с кандидатом.
 # Для верных пар оценка обычно > 0,9, для посторонних расценок — < 0,1.

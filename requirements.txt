@@ -1,0 +1,9 @@
+# Зависимости RAG-модуля (модели работают в отдельном контейнере ml — torch здесь не нужен).
+# Установка: python -m pip install -r requirements.txt
+
+sqlalchemy>=2.0.30        # ORM и SQL
+psycopg[binary]>=3.2      # драйвер PostgreSQL
+pgvector>=0.3.6           # тип vector для SQLAlchemy
+pydantic-settings>=2.4    # настройки из .env
+openpyxl>=3.1.5           # чтение xlsx
+httpx>=0.27               # HTTP-клиент к ML-сервису

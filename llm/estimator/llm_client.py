@@ -8,7 +8,7 @@ from typing import TypeVar
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from estimator.schemas import parse_json_object
+from llm.estimator.schemas import parse_json_object
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 

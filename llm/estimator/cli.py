@@ -1,7 +1,7 @@
 """Командная строка: черновик сметы по фотографиям заявки.
 
 Пример:
-    python -m estimator.cli фото1.jpg фото2.jpg -d "Трещина в стене подъезда, длина 3 м"
+    python -m llm.estimator.cli фото1.jpg фото2.jpg -d "Трещина в стене подъезда, длина 3 м"
 
 Результат сохраняется в results/<время>/: estimate.html, estimate.csv, estimate.json, trace.json.
 Нужны запущенные контейнеры pzr-db, ml и llm и загруженный справочник (python -m rag.cli load …).
@@ -14,10 +14,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from estimator.config import get_estimator_settings
-from estimator.estimate import estimate_csv, estimate_html
-from estimator.llm_client import LLMServiceClient
-from estimator.pipeline import analyze_case, prepare_image
+from llm.estimator.config import get_estimator_settings
+from llm.estimator.estimate import estimate_csv, estimate_html
+from llm.estimator.llm_client import LLMServiceClient
+from llm.estimator.pipeline import analyze_case, prepare_image
 from rag.config import get_settings
 from rag.db import get_session_factory
 from rag.ml_client import build_ml_client
@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     Принимает: argv — аргументы командной строки (по умолчанию из sys.argv).
     Возвращает: код выхода (0 — успех).
     """
-    parser = argparse.ArgumentParser(prog="python -m estimator.cli", description="Черновик сметы ПЗР по фото")
+    parser = argparse.ArgumentParser(prog="python -m llm.estimator.cli", description="Черновик сметы ПЗР по фото")
     parser.add_argument("photos", nargs="*", type=Path, help="0–4 фото одной заявки (JPEG/PNG/WebP)")
     parser.add_argument("-d", "--description", default="", help="описание заявки (необязательно)")
     parser.add_argument("--out", type=Path, default=Path("results"), help="папка для результатов")

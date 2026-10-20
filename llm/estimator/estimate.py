@@ -15,7 +15,7 @@ import re
 from decimal import ROUND_HALF_UP, Decimal
 
 from rag.normalizers import normalize_unit
-from estimator.schemas import Observations, Selection, WorkChoice
+from llm.estimator.schemas import Observations, Selection, WorkChoice
 
 # Единицы, которые разрешено «считать по фото» — отдельные различимые предметы.
 COUNTABLE_UNITS = {"шт", "лампа", "прибор", "счетчик", "узел"}
@@ -53,7 +53,7 @@ def checked_quantity(choice: WorkChoice, item: dict, description: str, image_cou
         return None, "Объём не определён по исходным данным."
     quantity = Decimal(str(choice.quantity))
     # Единицы сравниваем после той же нормализации, что и в справочнике («мп» = «м» и т.п.).
-    if normalize_unit(choice.quantity_unit)[0] != item["unit"]:
+    if normalize_unit(choice.quantity_unit) != item["unit"]:
         return None, "Единица объёма не совпадает со справочником; пересчёт не выполнен."
 
     if choice.quantity_source == "description":
