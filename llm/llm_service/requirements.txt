@@ -1,0 +1,8 @@
+# Зависимости LLM-сервиса (torch ставится отдельно в Dockerfile — с индекса PyTorch).
+# Версии transformers/accelerate как в проверенном ноутбуке PZR_Qwen_Colab.ipynb.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+transformers==4.57.6
+accelerate==1.12.0
+bitsandbytes>=0.48.2
+Pillow>=10.4
