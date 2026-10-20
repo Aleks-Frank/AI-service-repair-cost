@@ -2,7 +2,7 @@
 
 Парсер ничего не знает о базе данных: на входе путь к файлу, на выходе ParseResult
 со списком разделов, расценок и найденных проблем. Благодаря этому его можно
-тестировать без БД и запускать отдельно как «валидатор» справочника.
+запускать отдельно как «валидатор» справочника (python -m rag.cli validate).
 
 Ожидаемая структура листа (как в «Справочник ПЗР.xlsx»):
     A — № п/п, B — наименование, C — состав работ, D — ед. изм., E — кол-во,
@@ -11,6 +11,7 @@
 Первые строки — шапка; данные начинаются с первой строки «Раздел …».
 """
 
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -23,6 +24,7 @@ from rag.normalizers import (
     extract_book_number,
     extract_norm_reference,
     is_section_title,
+    normalize_for_match,
     normalize_unit,
     parse_item_number,
     parse_quantity,
@@ -43,23 +45,18 @@ HEADER_SCAN_ROWS = 10
 
 @dataclass
 class DataIssue:
-    """Проблема в данных, найденная при разборе строки.
-
-    severity: "error" — расценку нельзя использовать в смете без исправления;
-              "warning" — расценка пригодна, но данные стоит проверить.
-    """
+    """Проблема в данных справочника: нет цены, цена не сходится или дубль наименования."""
 
     code: str
-    severity: str
     message: str
 
     def to_dict(self) -> dict[str, str]:
         """Преобразует проблему в словарь для сохранения в JSONB.
 
         Принимает: ничего.
-        Возвращает: словарь {"code", "severity", "message"}.
+        Возвращает: словарь {"code", "message"}.
         """
-        return {"code": self.code, "severity": self.severity, "message": self.message}
+        return {"code": self.code, "message": self.message}
 
 
 @dataclass
@@ -110,52 +107,26 @@ class ParsedRate:
         parts.append(f"Единица измерения: {self.unit}.")
         return " ".join(parts)
 
-    @property
-    def has_errors(self) -> bool:
-        """Проверяет, есть ли у расценки проблемы уровня error.
-
-        Принимает: ничего.
-        Возвращает: True, если хотя бы одна проблема имеет severity == "error".
-        """
-        return any(issue.severity == "error" for issue in self.issues)
-
-
-@dataclass
-class SkippedRow:
-    """Строка, которую парсер не смог отнести ни к разделу, ни к расценке."""
-
-    sheet: str
-    row: int
-    reason: str
-    content: str
-
 
 @dataclass
 class ParseResult:
-    """Итог разбора файла: разделы, расценки и пропущенные строки."""
+    """Итог разбора файла: разделы и расценки."""
 
     source_file: str
     sections: list[ParsedSection]
     rates: list[ParsedRate]
-    skipped: list[SkippedRow]
 
     def summary(self) -> dict[str, Any]:
-        """Считает сводную статистику разбора (удобно для логов и CLI).
+        """Считает сводную статистику разбора (для логов и CLI).
 
         Принимает: ничего.
-        Возвращает: словарь с количеством разделов, расценок, проблем по кодам и т.п.
+        Возвращает: словарь с количеством разделов, расценок и проблем по типам.
         """
-        issue_counts: dict[str, int] = {}
-        for rate in self.rates:
-            for issue in rate.issues:
-                issue_counts[issue.code] = issue_counts.get(issue.code, 0) + 1
+        issue_counts = Counter(issue.code for rate in self.rates for issue in rate.issues)
         return {
             "source_file": self.source_file,
             "sections": len(self.sections),
             "rates": len(self.rates),
-            "rates_with_errors": sum(1 for r in self.rates if r.has_errors),
-            "rates_without_price": sum(1 for r in self.rates if r.unit_price is None),
-            "skipped_rows": len(self.skipped),
             "issues_by_code": dict(sorted(issue_counts.items())),
         }
 
@@ -169,65 +140,48 @@ def _cell(row: tuple[Any, ...], index: int) -> Any:
     return row[index] if index < len(row) else None
 
 
-def _validate_prices(rate: ParsedRate) -> None:
-    """Проверяет согласованность цены, трудозатрат и ставки; дописывает проблемы в rate.issues.
+def _price_issues(rate: ParsedRate) -> list[DataIssue]:
+    """Проверяет цену расценки: указана ли она и сходится ли с трудозатратами.
 
     Цена в справочнике должна равняться: трудозатраты × стоимость чел.-ч × количество.
     Расхождение — повод для сметчика проверить строку (это и есть «аномалия» в данных).
 
     Принимает: rate — разобранная расценка.
-    Возвращает: ничего (изменяет rate на месте).
+    Возвращает: список найденных проблем (пустой, если всё в порядке).
     """
     if rate.unit_price is None:
-        rate.issues.append(DataIssue("no_price", "error", "Не указана стоимость за единицу"))
-    if rate.labor_hours is None:
-        rate.issues.append(DataIssue("no_labor_hours", "warning", "Не указаны затраты труда (чел.-ч)"))
-    if rate.labor_rate is None:
-        rate.issues.append(DataIssue("no_labor_rate", "warning", "Не указана стоимость чел.-ч"))
-
-    # Сверяем цену, только если есть все три составляющие.
-    if None in (rate.unit_price, rate.labor_hours, rate.labor_rate):
-        return
-    expected = rate.labor_hours * rate.labor_rate * rate.quantity  # type: ignore[operator]
-    difference = abs(expected - rate.unit_price)  # type: ignore[operator]
-    if difference > PRICE_TOLERANCE_RUB:
-        rate.issues.append(
-            DataIssue(
-                "price_mismatch",
-                "warning",
-                f"Цена {rate.unit_price} ≠ трудозатраты × ставка × кол-во = {expected:.2f} "
-                f"(расхождение {difference:.2f} руб.)",
-            )
-        )
+        return [DataIssue("no_price", "Не указана стоимость за единицу")]
+    # Сверяем цену, только если в строке есть обе составляющие расчёта.
+    if rate.labor_hours is None or rate.labor_rate is None:
+        return []
+    expected = rate.labor_hours * rate.labor_rate * rate.quantity
+    difference = abs(expected - rate.unit_price)
+    if difference <= PRICE_TOLERANCE_RUB:
+        return []
+    return [DataIssue(
+        "price_mismatch",
+        f"Цена {rate.unit_price} ≠ трудозатраты × ставка × кол-во = {expected:.2f} (расхождение {difference:.2f} руб.)",
+    )]
 
 
-def _parse_sheet(sheet: Any, sheet_index: int) -> tuple[list[ParsedSection], list[ParsedRate], list[SkippedRow]]:
+def _parse_sheet(sheet: Any, sheet_index: int) -> tuple[list[ParsedSection], list[ParsedRate]]:
     """Разбирает один лист справочника.
 
     Принимает:
-        sheet — лист openpyxl (открытый в режиме values_only);
+        sheet — лист openpyxl;
         sheet_index — порядковый номер листа (запасной вариант номера справочника).
-    Возвращает: кортеж (разделы, расценки, пропущенные строки) этого листа.
+    Возвращает: кортеж (разделы, расценки) этого листа.
     """
     sheet_name = sheet.title.strip()
     rows = list(sheet.iter_rows(values_only=True))
 
     # --- 1. Номер справочника из шапки («Справочник № 2»), иначе — номер листа. ---
-    book_number = None
-    for row in rows[:HEADER_SCAN_ROWS]:
-        for value in row:
-            book_number = extract_book_number(clean_text(value))
-            if book_number:
-                break
-        if book_number:
-            break
-    book_number = book_number or sheet_index + 1
+    header_numbers = (extract_book_number(clean_text(value)) for row in rows[:HEADER_SCAN_ROWS] for value in row)
+    book_number = next((number for number in header_numbers if number), sheet_index + 1)
 
     sections: list[ParsedSection] = []
     rates: list[ParsedRate] = []
-    skipped: list[SkippedRow] = []
     seen_codes: set[str] = set()
-
     current_section: ParsedSection | None = None
     # Последний встреченный номер позиции и счётчик ненумерованных строк после него.
     last_number = 0
@@ -241,29 +195,17 @@ def _parse_sheet(sheet: Any, sheet_index: int) -> tuple[list[ParsedSection], lis
         first_text = clean_text(number_cell) if isinstance(number_cell, str) else None
 
         # --- 2. Заголовок раздела: «Раздел …» в колонке A или B и пустая единица. ---
-        section_title = name if is_section_title(name) else first_text if is_section_title(first_text) else None
+        section_title = next((text for text in (name, first_text) if is_section_title(text)), None)
         if section_title and not unit_cell:
             current_section = ParsedSection(book_number, sheet_name, section_title, len(sections) + 1)
             sections.append(current_section)
             continue
 
-        # До первого раздела идёт шапка таблицы — пропускаем её молча.
-        if current_section is None:
+        # Шапка до первого раздела, пустые строки и строки без наименования/единицы — не расценки.
+        if current_section is None or not name or not unit_cell:
             continue
 
-        # Полностью пустые строки пропускаем молча.
-        if all(value is None or (isinstance(value, str) and not value.strip()) for value in row):
-            continue
-
-        # --- 3. Строка без наименования или единицы — это не расценка. ---
-        if not name or not unit_cell:
-            content = " | ".join(str(v) for v in row if v is not None)
-            skipped.append(SkippedRow(sheet_name, row_number, "нет наименования или единицы измерения", content[:200]))
-            continue
-
-        issues: list[DataIssue] = []
-
-        # --- 4. Код расценки. ---
+        # --- 3. Код расценки. ---
         item_number = parse_item_number(number_cell)
         if item_number is not None:
             last_number, unnumbered_after_last = item_number, 0
@@ -273,38 +215,25 @@ def _parse_sheet(sheet: Any, sheet_index: int) -> tuple[list[ParsedSection], lis
             # Даём ей код от предыдущей позиции: «2-17.1», «2-17.2», ...
             unnumbered_after_last += 1
             code = f"{book_number}-{last_number}.{unnumbered_after_last}"
-            issues.append(DataIssue("no_item_number", "warning", "В файле нет номера позиции, код сгенерирован"))
         if code in seen_codes:
             # Защита от повторной нумерации в файле: код обязан быть уникальным.
             code = f"{code}-r{row_number}"
-            issues.append(DataIssue("duplicate_number", "warning", "Номер позиции повторяется в файле"))
         seen_codes.add(code)
 
-        # --- 5. Единица измерения и количество. ---
-        unit, unit_known = normalize_unit(unit_cell)
-        if not unit_known:
-            issues.append(DataIssue("unknown_unit", "warning", f"Неизвестная единица измерения «{unit_cell}»"))
+        # --- 4. Примечания из служебных колонок (I и правее). ---
+        notes = "; ".join(text for text in map(clean_text, row[FIRST_NOTES_COL:]) if text) or None
+
+        # Количество: цена в справочнике всегда «за единицу», поэтому без значения берём 1.
         quantity = parse_quantity(_cell(row, COL_QTY))
-        if quantity is None or quantity <= 0:
-            # В справочнике цена всегда дана «за единицу», поэтому по умолчанию берём 1.
-            quantity = Decimal("1")
-            issues.append(DataIssue("no_quantity", "warning", "Не указано количество, принято 1"))
-
-        # --- 6. Примечания из служебных колонок (I и правее). ---
-        note_values = [clean_text(v) for v in row[FIRST_NOTES_COL:]]
-        notes = "; ".join(v for v in note_values if v) or None
-        if notes and "исключить" in notes.lower():
-            issues.append(DataIssue("marked_for_exclusion", "warning", "В примечаниях строка помечена «исключить»"))
-
         rate = ParsedRate(
             code=code,
             item_number=item_number,
             section=current_section,
             name=name,
             work_composition=clean_text(_cell(row, COL_COMPOSITION), keep_newlines=True),
-            unit=unit,
+            unit=normalize_unit(unit_cell),
             unit_raw=unit_cell,
-            quantity=quantity,
+            quantity=quantity if quantity and quantity > 0 else Decimal("1"),
             labor_hours=to_decimal(_cell(row, COL_LABOR)),
             labor_rate=to_decimal(_cell(row, COL_LABOR_RATE)),
             unit_price=to_decimal(_cell(row, COL_PRICE)),
@@ -312,38 +241,12 @@ def _parse_sheet(sheet: Any, sheet_index: int) -> tuple[list[ParsedSection], lis
             notes=notes,
             source_sheet=sheet_name,
             source_row=row_number,
-            issues=issues,
         )
-        # --- 7. Проверка согласованности цены. ---
-        _validate_prices(rate)
+        # --- 5. Проверка цены. ---
+        rate.issues.extend(_price_issues(rate))
         rates.append(rate)
 
-    return sections, rates, skipped
-
-
-def parse_price_book(path: str | Path) -> ParseResult:
-    """Разбирает xlsx-справочник целиком (все листы).
-
-    Принимает: path — путь к xlsx-файлу.
-    Возвращает: ParseResult с разделами, расценками и пропущенными строками.
-    """
-    path = Path(path)
-    # data_only=True: читаем не формулы («=F9*G9»), а значения, которые Excel
-    # сохранил при последнем пересчёте. read_only ускоряет чтение больших файлов.
-    workbook = load_workbook(path, data_only=True, read_only=True)
-    try:
-        all_sections: list[ParsedSection] = []
-        all_rates: list[ParsedRate] = []
-        all_skipped: list[SkippedRow] = []
-        for index, sheet in enumerate(workbook.worksheets):
-            sections, rates, skipped = _parse_sheet(sheet, index)
-            all_sections.extend(sections)
-            all_rates.extend(rates)
-            all_skipped.extend(skipped)
-    finally:
-        workbook.close()
-    _mark_duplicate_names(all_rates)
-    return ParseResult(str(path), all_sections, all_rates, all_skipped)
+    return sections, rates
 
 
 def _mark_duplicate_names(rates: list[ParsedRate]) -> None:
@@ -355,13 +258,35 @@ def _mark_duplicate_names(rates: list[ParsedRate]) -> None:
     Принимает: rates — все расценки справочника.
     Возвращает: ничего (дописывает проблемы в rate.issues).
     """
-    # Группируем по ключу (наименование в нижнем регистре, единица).
     groups: dict[tuple[str, str], list[ParsedRate]] = {}
     for rate in rates:
-        groups.setdefault((rate.name.lower(), rate.unit), []).append(rate)
+        groups.setdefault((normalize_for_match(rate.name), rate.unit), []).append(rate)
     for group in groups.values():
         if len(group) < 2:
             continue
         for rate in group:
             others = ", ".join(other.code for other in group if other is not rate)
-            rate.issues.append(DataIssue("duplicate_name", "warning", f"Такое же наименование у позиций: {others}"))
+            rate.issues.append(DataIssue("duplicate_name", f"Такое же наименование у позиций: {others}"))
+
+
+def parse_price_book(path: str | Path) -> ParseResult:
+    """Разбирает xlsx-справочник целиком (все листы).
+
+    Принимает: path — путь к xlsx-файлу.
+    Возвращает: ParseResult с разделами и расценками.
+    """
+    path = Path(path)
+    # data_only=True: читаем не формулы («=F9*G9»), а значения, которые Excel
+    # сохранил при последнем пересчёте. read_only ускоряет чтение больших файлов.
+    workbook = load_workbook(path, data_only=True, read_only=True)
+    try:
+        sections: list[ParsedSection] = []
+        rates: list[ParsedRate] = []
+        for index, sheet in enumerate(workbook.worksheets):
+            sheet_sections, sheet_rates = _parse_sheet(sheet, index)
+            sections += sheet_sections
+            rates += sheet_rates
+    finally:
+        workbook.close()
+    _mark_duplicate_names(rates)
+    return ParseResult(str(path), sections, rates)
