@@ -1,4 +1,7 @@
-"""Настройки RAG-модуля: читаются из переменных окружения и файла .env (см. .env.example)."""
+"""Настройки RAG-модуля: читаются из переменных окружения и файла .env.
+
+Настройки LLM и конвейера сметы — отдельно, в llm/estimator/config.py.
+"""
 
 from functools import lru_cache
 
@@ -22,6 +25,11 @@ class Settings(BaseSettings):
     postgres_host: str = "localhost"
     postgres_port: int = 5432
 
+    # --- База прайсов поставщиков (отдельный контейнер prices-db; пользователь и пароль те же) ---
+    prices_db: str = "supplier_prices"
+    prices_host: str = "localhost"
+    prices_port: int = 5433
+
     # --- ML-сервис ---
     ml_service_url: str = "http://localhost:8001"
     # Таймаут HTTP-запроса к ML-сервису, секунды (загрузка всего справочника идёт пачками).
@@ -36,18 +44,24 @@ class Settings(BaseSettings):
     rrf_k: int = 60
     rerank_top_n: int = 30
 
-    @property
-    def database_url(self) -> str:
+    def _url(self, host: str, port: int, db: str) -> str:
         """Собирает строку подключения SQLAlchemy.
 
-        Принимает: ничего (использует поля настроек).
+        Принимает: host, port, db — адрес сервера и имя базы.
         Возвращает: строку вида postgresql+psycopg://user:pass@host:port/db.
         """
         # postgresql+psycopg — драйвер psycopg 3.
-        return (
-            f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        return f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}@{host}:{port}/{db}"
+
+    @property
+    def database_url(self) -> str:
+        """Строка подключения к базе справочника ПЗР (pzr_pricing)."""
+        return self._url(self.postgres_host, self.postgres_port, self.postgres_db)
+
+    @property
+    def prices_database_url(self) -> str:
+        """Строка подключения к базе прайсов поставщиков (supplier_prices)."""
+        return self._url(self.prices_host, self.prices_port, self.prices_db)
 
 
 @lru_cache
