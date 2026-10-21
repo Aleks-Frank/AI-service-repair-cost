@@ -1,4 +1,4 @@
-"""HTTP-клиент к ML-сервису (контейнер ml): эмбеддинги и переранжирование.
+"""HTTP-клиент к ML-сервису (контейнер ml_service): эмбеддинги и переранжирование.
 
 RAG-модуль не загружает модели сам — он отправляет тексты в ML-сервис
 и получает обратно векторы (/embed) или оценки релевантности (/rerank).
@@ -41,7 +41,7 @@ class MLServiceClient:
         except httpx.HTTPError as error:
             raise MLServiceError(
                 f"ML-сервис {self._http.base_url} недоступен или вернул ошибку: {error}. "
-                "Проверьте, что контейнер запущен: docker compose up -d ml"
+                "Проверьте, что контейнер запущен: docker compose up -d ml_service"
             ) from error
         return response.json()
 

@@ -1,20 +1,22 @@
-"""Загрузка справочника ПЗР в базу pzr_pricing.
+"""Загрузка справочника ПЗР (база pzr_pricing) и прайс-листов поставщиков (база supplier_prices).
 
-Порядок: разбор xlsx -> векторы для всех расценок (через ML-сервис) -> полная замена
-содержимого таблицы rates одной транзакцией. Версий справочника нет: каждая загрузка
-заменяет предыдущую. Если что-то упадёт, транзакция откатится и старые данные останутся.
+Порядок: разбор файла -> векторы для всех строк (через ML-сервис) -> замена данных
+одной транзакцией. Версий нет: каждая загрузка заменяет предыдущую (для прайса — только
+позиции этого поставщика). Если что-то упадёт, транзакция откатится и старые данные останутся.
 """
 
 import logging
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func
 from sqlalchemy.orm import Session
 
 from rag.db import Rate
 from rag.ml_client import MLServiceClient
 from rag.parser import ParsedRate, parse_price_book
+from rag.price_list_parser import parse_price_list
+from rag.prices_db import Material, Supplier
 
 logger = logging.getLogger(__name__)
 
@@ -67,5 +69,58 @@ def load_price_book(session: Session, path: str | Path, models: MLServiceClient)
     # --- 3. Замена содержимого таблицы в одной транзакции. ---
     session.execute(delete(Rate))
     session.add_all(_to_row(rate, vector) for rate, vector in zip(result.rates, vectors, strict=True))
+    session.commit()
+    return summary
+
+
+def load_price_list(session: Session, path: str | Path, supplier_code: str, models: MLServiceClient) -> dict[str, Any]:
+    """Загружает прайс-лист поставщика в базу supplier_prices.
+
+    Заменяются позиции только этого поставщика: прайсы остальных не трогаются.
+
+    Принимает:
+        session — сессия базы прайсов;
+        path — путь к .xls/.xlsx;
+        supplier_code — код поставщика по названию компании латиницей («ros_elektro»);
+        models — ML-сервис (нужен метод embed).
+    Возвращает: сводку разбора.
+    """
+    # --- 1. Разбор файла. ---
+    result = parse_price_list(path)
+    summary = result.summary()
+    logger.info("Разобрано: %s позиций, %s категорий", summary["materials"], summary["categories"])
+
+    # --- 2. Векторы для всех позиций. ---
+    vectors = models.embed([item.search_text for item in result.materials])
+
+    # --- 3. Поставщик (создаётся или обновляется) и замена его позиций одной транзакцией. ---
+    session.merge(Supplier(
+        code=supplier_code,
+        name=result.supplier_name or supplier_code,
+        price_date=result.price_date,
+        source_file=Path(path).name,
+        loaded_at=func.now(),
+    ))
+    session.execute(delete(Material).where(Material.supplier_code == supplier_code))
+    session.add_all(
+        Material(
+            supplier_code=supplier_code,
+            article=item.article,
+            name=item.name,
+            brand=item.brand,
+            category=item.category,
+            unit=item.unit,
+            unit_raw=item.unit_raw,
+            price=item.price,
+            stock=item.stock,
+            on_sale=item.on_sale,
+            pack_size=item.pack_size,
+            pack_unit=item.pack_unit,
+            source_row=item.source_row,
+            search_text=item.search_text,
+            embedding=vector,
+        )
+        for item, vector in zip(result.materials, vectors, strict=True)
+    )
     session.commit()
     return summary

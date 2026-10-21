@@ -1,4 +1,4 @@
-"""HTTP-клиент к LLM-сервису (контейнер llm) и получение от модели проверенного JSON."""
+"""HTTP-клиент к LLM-сервису (контейнер llm_service) и получение от модели проверенного JSON."""
 
 import base64
 import json
@@ -56,7 +56,7 @@ class LLMServiceClient:
             response = self._http.post("/generate", json=payload)
         except httpx.HTTPError as error:
             raise LLMServiceError(
-                f"LLM-сервис {self._http.base_url} недоступен: {error}. Запустите: docker compose up -d llm"
+                f"LLM-сервис {self._http.base_url} недоступен: {error}. Запустите: docker compose up -d llm_service"
             ) from error
         if response.status_code == 413:
             raise InputTooLong(response.json().get("detail", "Вход слишком длинный"))
