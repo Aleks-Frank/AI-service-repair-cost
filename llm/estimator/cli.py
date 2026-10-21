@@ -4,7 +4,7 @@
     python -m llm.estimator.cli фото1.jpg фото2.jpg -d "Трещина в стене подъезда, длина 3 м"
 
 Результат сохраняется в results/<время>/: estimate.html, estimate.csv, estimate.json, trace.json.
-Нужны запущенные контейнеры pzr-db, ml и llm и загруженный справочник (python -m rag.cli load …).
+Нужны запущенные контейнеры pzr-db, ml_service и llm_service и загруженный справочник (python -m rag.cli load …).
 """
 
 import argparse

@@ -1,9 +1,11 @@
-# Инфраструктура RAG-модуля AI-сметчика.
-#   db — PostgreSQL 17 + pgvector, база pzr_pricing (расценки ПЗР и их векторы);
-#   ml — ML-сервис: модели эмбеддингов и переранжирования (/embed, /rerank, /health).
+# Инфраструктура AI-сметчика.
+#   db          — PostgreSQL 17 + pgvector, база pzr_pricing (справочник ПЗР: расценки работ и их векторы);
+#   prices_db   — PostgreSQL 17 + pgvector, база supplier_prices (прайс-листы поставщиков материалов);
+#   ml_service  — модели эмбеддингов и переранжирования (/embed, /rerank, /health);
+#   llm_service — Qwen3-VL (анализ фото и выбор работ, /generate, /health).
 #
-# Запуск:    docker compose up -d --build     (первая сборка образа ml — ~3 ГБ загрузки)
-# Остановка: docker compose down             (данные БД сохраняются в volume pgdata)
+# Запуск:    docker compose up -d --build     (первая сборка образа ml_service — ~3 ГБ загрузки)
+# Остановка: docker compose down             (данные БД сохраняются в volume pgdata и prices_pgdata)
 
 # Имя группы контейнеров в Docker Desktop (по умолчанию было бы имя папки).
 name: ai-smetchik
@@ -29,11 +31,30 @@ services:
       timeout: 3s
       retries: 20
 
-  ml:
+  prices_db:
+    # Отдельная база для прайсов поставщиков: справочник ПЗР и цены материалов не смешиваются.
+    image: pgvector/pgvector:pg17
+    container_name: prices-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smeta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smeta}
+      POSTGRES_DB: ${PRICES_DB:-supplier_prices}
+    ports:
+      - "127.0.0.1:${PRICES_PORT:-5433}:5432"
+    volumes:
+      - prices_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ml_service:
     build:
       context: .
       dockerfile: ml_service/Dockerfile
-    container_name: pzr-ml
+    container_name: ml_service
     restart: unless-stopped
     environment:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
@@ -66,5 +87,40 @@ services:
       # Загрузка моделей занимает до пары минут — в это время проверки не считаются провалом.
       start_period: 180s
 
+  llm_service:
+    build:
+      # Всё, что относится к LLM, лежит в папке llm/ — она и есть контекст сборки.
+      context: ./llm
+      dockerfile: llm_service/Dockerfile
+    container_name: llm_service
+    restart: unless-stopped
+    environment:
+      LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3-VL-4B-Instruct}
+      MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-524288}
+      MAX_INPUT_TOKENS: ${MAX_INPUT_TOKENS:-10000}
+      HF_HOME: /hf-cache
+      # Позволяет PyTorch переиспользовать фрагменты видеопамяти — меньше ошибок нехватки памяти
+      # при генерациях с картинками разного размера.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/hf-cache
+    ports:
+      - "127.0.0.1:${LLM_PORT:-8002}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s
+
 volumes:
   pgdata:
+  prices_pgdata:
