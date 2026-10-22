@@ -68,6 +68,110 @@ def expand_abbreviations(text: str) -> str:
     return _ABBREVIATION_RE.sub(lambda match: _ABBREVIATIONS[match.group(1)], text)
 
 
+# --- Сопоставление одного товара у разных поставщиков ---------------------------------
+
+# Кириллические буквы, которые при наборе артикула легко спутать с латинскими.
+# «СКМР10D» (часть букв кириллицей) и «CKMP10D» — один артикул.
+_LOOKALIKE = str.maketrans("АВЕКМНОРСТУХ", "ABEKMHOPCTYX")
+
+
+def normalize_article(article: str) -> str:
+    """Приводит артикул к виду для сравнения между поставщиками.
+
+    Верхний регистр, без пробелов, похожие кириллические буквы -> латинские.
+    Суффиксы («-R», «-K01») не отрезаются: это могут быть разные модификации товара.
+
+    Принимает: article — артикул из прайса.
+    Возвращает: нормализованный артикул.
+    """
+    return re.sub(r"\s+", "", article).upper().translate(_LOOKALIKE)
+
+
+def pricing_units(unit: str, pack_size: Decimal | None, pack_unit: str | None) -> tuple[str, Decimal, bool]:
+    """Определяет базовую единицу, сколько её в единице цены и обязательна ли покупка упаковками.
+
+    Правило: кратность обязательна, только если цена указана за упаковку («компл», «уп»).
+        «компл» + «(4шт/компл)» -> базовая «шт», 4 шт в единице цены, покупка комплектами;
+        «уп» без фасовки в названии -> базовая «уп», состав упаковки неизвестен;
+        «шт» + «(6шт)», «м» + «(8м)» -> цена уже за штуку/метр, коробка справочно.
+
+    Принимает: unit — единица цены; pack_size, pack_unit — фасовка из наименования.
+    Возвращает: (базовая единица, базовых единиц в единице цены, покупать ли целыми упаковками).
+    """
+    if unit in {"компл", "уп"}:
+        if pack_size and pack_unit:
+            return pack_unit, pack_size, True
+        return unit, Decimal(1), True
+    return unit, Decimal(1), False
+
+
+# Ключевые параметры товара из наименования. Если у эталона есть такой параметр, у товара
+# другого поставщика он должен совпасть — иначе «Угол 40х16» спутается с «Углом 40х25».
+_PARAM_PATTERNS: dict[str, re.Pattern[str]] = {
+    "size": re.compile(r"(?<!\d)(\d+(?:[.,]\d+)?(?:\s*[хxХX×*/]\s*\d+(?:[.,]\d+)?)+)(?!\d)"),
+    "current": re.compile(r"(?<![\w.,])(\d+(?:[.,]\d+)?)\s?[АA](?![\w])"),
+    "power": re.compile(r"(?<![\w.,])(\d+(?:[.,]\d+)?)\s?Вт(?![\w])"),
+    "color_temp": re.compile(r"(?<![\w.,])(\d{4})\s?[КK](?![\w])"),
+    "socket": re.compile(r"(?<![\w])([ЕE]\d{2}|G[UX]?\d{1,2}(?:[.,]\d)?)(?![\w])"),
+    "ip": re.compile(r"(?<![\w])IP\s?(\d{2})(?![\w])"),
+}
+_COLORS = {
+    "бел": "белый", "черн": "черный", "сер": "серый", "крем": "кремовый", "беж": "бежевый",
+    "граф": "графит", "син": "синий", "красн": "красный", "желт": "желтый", "зелен": "зеленый",
+    "коричн": "коричневый", "алюм": "алюминий", "сереб": "серебро", "золот": "золото",
+}
+# Исполнение, которое отличает разные товары с одинаковыми размерами: «Угол внутренний 40х40»
+# и «Угол внешний 40х40». «Наружный» — синоним «внешнего» (так пишут у разных поставщиков).
+_KINDS = {"внутрен": "внутренний", "внешн": "внешний", "наружн": "внешний"}
+# Параметры, без которых товар считается другим (если они есть у эталона, а у кандидата нет).
+CRITICAL_PARAMS = ("size", "current", "power", "socket")
+
+
+def extract_params(name: str) -> dict[str, list[str]]:
+    """Извлекает ключевые параметры из наименования: размер, ток, мощность, цоколь, IP, цвет.
+
+    Принимает: name — наименование позиции.
+    Возвращает: словарь {параметр: отсортированный список значений}; пример:
+        «Угол внешний КМН 40х16 белый (4шт/компл)» -> {"size": ["40x16"], "color": ["белый"], "kind": ["внешний"]}.
+    """
+    params: dict[str, list[str]] = {}
+    for key, pattern in _PARAM_PATTERNS.items():
+        values = set()
+        for match in pattern.finditer(name):
+            # Единый вид значения: латиница, точка вместо запятой, «х» -> «x», без пробелов.
+            value = re.sub(r"\s+", "", match.group(1)).upper().translate(_LOOKALIKE).replace(",", ".")
+            values.add(re.sub(r"[XХ×*]", "x", value) if key == "size" else value)
+        if values:
+            params[key] = sorted(values)
+    words = re.findall(r"[а-яё]+", name.lower())
+    colors = {color for stem, color in _COLORS.items() for word in words if word.startswith(stem)}
+    if colors:
+        params["color"] = sorted(colors)
+    kinds = {kind for stem, kind in _KINDS.items() for word in words if word.startswith(stem)}
+    if kinds:
+        params["kind"] = sorted(kinds)
+    return params
+
+
+def params_match(reference: dict[str, list[str]], candidate: dict[str, list[str]]) -> bool:
+    """Проверяет, что у кандидата те же ключевые параметры, что и у эталона.
+
+    Правила: параметр, который есть у обоих, должен совпасть; критичный параметр эталона
+    (размер, ток, мощность, цоколь) обязан быть и у кандидата. Цвет или IP, не указанные
+    у кандидата, не считаются расхождением — их часто опускают в названии.
+
+    Принимает: reference, candidate — результаты extract_params.
+    Возвращает: True, если товары можно считать одинаковыми по параметрам.
+    """
+    for key, values in reference.items():
+        if key in candidate:
+            if candidate[key] != values:
+                return False
+        elif key in CRITICAL_PARAMS:
+            return False
+    return True
+
+
 @dataclass
 class ParsedMaterial:
     """Одна позиция прайс-листа."""
@@ -97,6 +201,24 @@ class ParsedMaterial:
         name = expand_abbreviations(self.name)
         return f"{name}\nКатегория: {self.category}" if self.category else name
 
+    @property
+    def pricing(self) -> tuple[str, Decimal, bool]:
+        """Базовая единица, базовых единиц в единице цены и обязательность покупки упаковками.
+
+        Принимает: ничего.
+        Возвращает: кортеж из pricing_units().
+        """
+        return pricing_units(self.unit, self.pack_size, self.pack_unit)
+
+    @property
+    def base_price(self) -> Decimal:
+        """Цена за одну базовую единицу (за 1 шт или 1 м) — по ней сравниваются поставщики.
+
+        Принимает: ничего.
+        Возвращает: цену с точностью до 0,0001 руб.
+        """
+        return (self.price / self.pricing[1]).quantize(Decimal("0.0001"))
+
 
 @dataclass
 class PriceListResult:
@@ -123,6 +245,8 @@ class PriceListResult:
             "categories": len({m.category for m in self.materials}),
             "units": dict(Counter(m.unit for m in self.materials).most_common()),
             "with_pack": sum(m.pack_size is not None for m in self.materials),
+            # Позиции, которые покупаются только целыми упаковками (цена за «компл»/«уп»).
+            "sold_by_pack": sum(m.pricing[2] for m in self.materials),
             "skipped": dict(Counter(reason for _, reason in self.skipped)),
         }
 
@@ -159,10 +283,14 @@ def _find_header(rows: list[tuple[int, int, list]]) -> tuple[int, dict[str, int]
     Заголовок бывает в две строки («6. для тендеров» над «Цена»), поэтому текст колонки
     склеивается из строки с «Артикул» и следующей за ней.
 
+    Заголовок — первая строка со словом «артикул», в которой нашлись все обязательные колонки
+    (слово может встретиться и в шапке, например в названии поставщика).
+
     Принимает: rows — строки листа.
     Возвращает: (индекс строки заголовка в rows, {ключ колонки: номер колонки}).
     Исключения: ValueError, если заголовок или обязательные колонки не найдены.
     """
+    missing: list[str] = []
     for index, (_, _, values) in enumerate(rows):
         texts = [(clean_text(value) or "").lower() for value in values]
         if not any("артикул" in text for text in texts):
@@ -183,9 +311,10 @@ def _find_header(rows: list[tuple[int, int, list]]) -> tuple[int, dict[str, int]
             if column is not None:
                 columns[key] = column
         missing = [key for key in _REQUIRED_COLUMNS if key not in columns]
-        if missing:
-            raise ValueError(f"В заголовке прайса не найдены колонки: {', '.join(missing)}")
-        return index, columns
+        if not missing:
+            return index, columns
+    if missing:
+        raise ValueError(f"В заголовке прайса не найдены колонки: {', '.join(missing)}")
     raise ValueError("Не найдена строка заголовка с колонкой «Артикул».")
 
 

@@ -61,7 +61,8 @@ _RATE_FILTERS = """
     AND (NOT :only_priced OR r.unit_price IS NOT NULL)
 """
 _MATERIAL_FILTERS = """
-    (CAST(:suppliers AS text[]) IS NULL OR r.supplier_code = ANY(CAST(:suppliers AS text[])))
+    r.supplier_code IN (SELECT code FROM suppliers WHERE active)
+    AND (CAST(:suppliers AS text[]) IS NULL OR r.supplier_code = ANY(CAST(:suppliers AS text[])))
     AND (CAST(:units AS text[]) IS NULL OR r.unit = ANY(CAST(:units AS text[])))
     AND (NOT :in_stock_only OR r.stock > 0)
 """
@@ -123,6 +124,11 @@ LIMIT :limit
 """
 
 
+# Сколько лучших позиций КАЖДОЙ ветки всегда отдаётся reranker'у, даже если по RRF они ниже
+# rerank_top_n. Пример: «Смена выключателей и розеток» — 1-я в векторной ветке, но полнотекстовая
+# её не видит (стеммер: «розетки» -> «розетк», «розеток» -> «розеток»), и по RRF она только 13-я.
+_BRANCH_TOP_ALWAYS = 3
+
 _RATES_SQL = _hybrid_sql("rates", _RATE_FILTERS)
 _MATERIALS_SQL = _hybrid_sql("materials", _MATERIAL_FILTERS)
 
@@ -164,6 +170,11 @@ class _HybridSearch:
         self._models = models
         self._settings = settings
 
+    @property
+    def session(self) -> Session:
+        """Сессия базы, в которой ищет этот поисковик (нужна подбору предложений поставщиков)."""
+        return self._session
+
     def _search(self, query: str, top_k: int, use_reranker: bool, filters: dict) -> SearchResult:
         """Выполняет поиск: вектор запроса -> SQL (две ветки + RRF) -> переранжирование.
 
@@ -198,10 +209,17 @@ class _HybridSearch:
                 "query_text": query,
                 "per_branch": self._settings.search_candidates_per_branch,
                 "rrf_k": self._settings.rrf_k,
-                "limit": sql_limit,
+                # Берём весь список RRF (не больше 2 × размер ветки), чтобы найти лидеров веток ниже лимита.
+                "limit": max(sql_limit, 2 * self._settings.search_candidates_per_branch) if use_reranker else sql_limit,
                 **filters,
             },
         ).mappings().all()
+        if use_reranker:
+            # Первые sql_limit по RRF + лидеры каждой ветки, оказавшиеся ниже по RRF.
+            rows = rows[:sql_limit] + [
+                row for row in rows[sql_limit:]
+                if (row["dense_rank"] or 10**9) <= _BRANCH_TOP_ALWAYS or (row["lexical_rank"] or 10**9) <= _BRANCH_TOP_ALWAYS
+            ]
         timings["sql"] = _elapsed_ms(start)
 
         # --- 3. Полные данные найденных строк одним запросом. ---

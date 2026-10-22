@@ -19,7 +19,7 @@ from sqlalchemy import (
     Boolean, Computed, Date, DateTime, Engine, ForeignKey, Index, Integer, Numeric, String, Text,
     UniqueConstraint, func, text,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from rag.config import get_settings
@@ -48,6 +48,22 @@ class Supplier(PricesBase):
     source_file: Mapped[str] = mapped_column(String(512))
     loaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # --- Параметры подбора (заготовка под нескольких поставщиков) ---
+    # Неактивный поставщик не участвует ни в поиске, ни в подборе цены.
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Артикул в прайсе — код производителя (общий у всех дистрибьюторов) или свой код поставщика.
+    # Только по артикулам производителя товары разных поставщиков сопоставляются напрямую.
+    article_is_manufacturer: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    # Цены с НДС (True), без НДС (False) или неизвестно (None). Пока не используется в расчёте.
+    vat_included: Mapped[bool | None] = mapped_column(Boolean)
+    # Приоритет при равной цене (больше — предпочтительнее), например договорной поставщик.
+    priority: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Сколько дней прайс считается актуальным; позже — предупреждение «цена устарела».
+    price_valid_days: Mapped[int] = mapped_column(Integer, default=30, server_default="30")
+    # Условия доставки — на будущее (сейчас доставка в подборе не учитывается).
+    delivery_cost: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    free_delivery_from: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+
 
 class Material(PricesBase):
     """Позиция прайс-листа конкретного поставщика."""
@@ -70,22 +86,32 @@ class Material(PricesBase):
     # При удалении поставщика удаляются и его позиции.
     supplier_code: Mapped[str] = mapped_column(ForeignKey("suppliers.code", ondelete="CASCADE"), index=True)
     article: Mapped[str] = mapped_column(String(128))
+    # Артикул для сопоставления между поставщиками (см. normalize_article).
+    article_norm: Mapped[str] = mapped_column(String(128), index=True)
     name: Mapped[str] = mapped_column(Text)
     # Бренд — группа верхнего уровня прайса («ИЕК», «ITK»), может отсутствовать.
     brand: Mapped[str | None] = mapped_column(String(128))
     # Путь групп прайса: «Кабеленесущие системы / Кабель-каналы и аксессуары / …».
     category: Mapped[str] = mapped_column(Text)
 
-    # Единица после нормализации и как в файле; цена — за эту единицу.
+    # Единица цены после нормализации и как в файле; price — за эту единицу («компл», «шт», «м»).
     unit: Mapped[str] = mapped_column(String(32), index=True)
     unit_raw: Mapped[str] = mapped_column(String(64))
     price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    # Базовая единица («шт», «м»), сколько её в единице цены, цена за 1 базовую единицу
+    # и обязательна ли покупка целыми упаковками (см. pricing_units).
+    base_unit: Mapped[str] = mapped_column(String(32))
+    units_per_price_unit: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+    base_price: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    sold_by_pack: Mapped[bool] = mapped_column(Boolean)
     # Остаток на складе поставщика (None — не указан) и признак распродажи.
     stock: Mapped[Decimal | None] = mapped_column(Numeric(14, 3))
     on_sale: Mapped[bool] = mapped_column(Boolean, default=False)
     # Фасовка из наименования: «(8м)» -> 8 м, «(4шт/компл)» -> 4 шт. Пока только справочно.
     pack_size: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
     pack_unit: Mapped[str | None] = mapped_column(String(32))
+    # Ключевые параметры из наименования: {"size": ["40x16"], "color": ["белый"]} (см. extract_params).
+    params: Mapped[dict[str, list[str]]] = mapped_column(JSONB, default=dict)
 
     source_row: Mapped[int] = mapped_column(Integer)
     search_text: Mapped[str] = mapped_column(Text)
@@ -103,12 +129,17 @@ def get_prices_session_factory() -> sessionmaker[Session]:
     return sessionmaker(bind=build_engine(get_settings().prices_database_url), expire_on_commit=False)
 
 
-def init_prices_db(engine: Engine) -> None:
+def init_prices_db(engine: Engine, recreate: bool = False) -> None:
     """Создаёт расширение pgvector и таблицы suppliers и materials, если их ещё нет.
 
-    Принимает: engine — движок базы прайсов.
+    Миграций нет: после изменения структуры таблиц их нужно пересоздать (recreate=True)
+    и заново загрузить прайсы всех поставщиков.
+
+    Принимает: engine — движок базы прайсов; recreate — удалить таблицы и создать заново.
     Возвращает: ничего.
     """
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    if recreate:
+        PricesBase.metadata.drop_all(engine)
     PricesBase.metadata.create_all(engine)
