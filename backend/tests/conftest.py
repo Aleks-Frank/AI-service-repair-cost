@@ -20,9 +20,10 @@ def headers():
 def client_factory(tmp_path):
     with ExitStack() as stack:
 
-        def make(handler=None, **overrides):
+        def make(handler=None, agent=None, **overrides):
             values = {
                 "_env_file": None,
+                "ai_enabled": False,
                 "database_path": tmp_path / "requests.sqlite3",
                 "api_key": API_KEY,
                 "bitrix_outbound_token": OUTBOUND_TOKEN,
@@ -37,7 +38,9 @@ def client_factory(tmp_path):
                 def handler(request):
                     raise AssertionError("Tests must never access a real Bitrix portal")
 
-            app = create_app(Settings(**values), bitrix_transport=httpx.MockTransport(handler))
+            app = create_app(
+                Settings(**values), bitrix_transport=httpx.MockTransport(handler), agent=agent
+            )
             return stack.enter_context(TestClient(app))
 
         yield make

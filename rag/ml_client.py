@@ -29,6 +29,9 @@ class MLServiceClient:
         self._http = httpx.Client(base_url=base_url, timeout=timeout_s)
         self._embed_batch = embed_batch
 
+    def close(self) -> None:
+        self._http.close()
+
     def _post(self, path: str, payload: dict) -> dict:
         """Отправляет POST-запрос и превращает сетевые ошибки в MLServiceError.
 

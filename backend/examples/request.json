@@ -2,7 +2,7 @@
   "external_id": "42",
   "data": {
     "description": "Протечка трубы в подвале",
-    "photo_urls": ["https://example.com/defect.jpg"],
+    "images": [],
     "object": {
       "address": "Тестовый адрес",
       "system": "Холодное водоснабжение"

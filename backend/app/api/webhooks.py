@@ -6,6 +6,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.dependencies import get_repository
 from app.core.errors import ServiceError
 from app.core.security import check_secret
+from app.integrations.agent import agent_input
 from app.integrations.webhook import get_path, read_webhook
 from app.models import Receipt
 from app.repository import RequestRepository, fingerprint
@@ -48,11 +49,18 @@ async def receive_bitrix(
         raise ServiceError(422, "invalid_event_data", "Event data must be an object")
     external_id = get_path(payload, settings.bitrix_entity_id_path)
     payload.pop("auth", None)
+    if settings.ai_enabled:
+        await run_in_threadpool(agent_input, payload, "bitrix", settings)
     dedup_key = None
     event_time = payload.get("ts")
     if isinstance(event_time, (str, int)) and not isinstance(event_time, bool) and str(event_time):
         dedup_key = "bitrix:" + fingerprint(payload)
     record, duplicate = await run_in_threadpool(
-        repository.create, "bitrix", external_id, payload, dedup_key
+        repository.create,
+        "bitrix",
+        external_id,
+        payload,
+        dedup_key,
+        queue_limit=settings.ai_queue_limit if settings.ai_enabled else None,
     )
     return Receipt(request_id=record.id, status=record.status, duplicate=duplicate)

@@ -60,9 +60,9 @@ def find_candidates(retriever: HybridRetriever, observations: Observations, per_
             for hit in retriever.search(query, top_k=per_finding).hits:
                 # Основная оценка — reranker; если он не применялся, берём балл RRF.
                 score = hit.rerank_score if hit.rerank_score is not None else hit.rrf_score
-                code = hit.rate.code
+                code = hit.item.code
                 if code not in best or score > best[code][0]:
-                    best[code] = (score, hit.rate)
+                    best[code] = (score, hit.item)
         top = sorted(best.values(), key=lambda pair: pair[0], reverse=True)[:per_finding]
         for score, rate in top:
             merged.setdefault(rate.code, _candidate(rate, score))["finding_ids"].append(finding.finding_id)

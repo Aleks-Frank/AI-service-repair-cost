@@ -34,6 +34,9 @@ class LLMServiceClient:
         """
         self._http = httpx.Client(base_url=base_url, timeout=timeout_s)
 
+    def close(self) -> None:
+        self._http.close()
+
     def generate(self, system_prompt: str, user_prompt: str, images: list[bytes], max_new_tokens: int) -> str:
         """Отправляет промпт и фотографии модели и возвращает её текстовый ответ.
 

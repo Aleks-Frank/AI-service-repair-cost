@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.dependencies import get_repository
 from app.core.errors import ServiceError
 from app.core.security import require_api_key
+from app.integrations.agent import agent_input
 from app.models import (
     CreateRequest,
     Receipt,
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 def create_request(
     body: CreateRequest,
     repository: Repository,
+    request: Request,
     idempotency_key: Annotated[
         str | None,
         Header(
@@ -41,8 +43,15 @@ def create_request(
         ),
     ] = None,
 ) -> Receipt:
+    settings = request.app.state.settings
+    if settings.ai_enabled:
+        agent_input(body.data, "api", settings)
     record, duplicate = repository.create(
-        "api", body.external_id, body.data, f"api:{idempotency_key}" if idempotency_key else None
+        "api",
+        body.external_id,
+        body.data,
+        f"api:{idempotency_key}" if idempotency_key else None,
+        queue_limit=settings.ai_queue_limit if settings.ai_enabled else None,
     )
     return Receipt(request_id=record.id, status=record.status, duplicate=duplicate)
 
@@ -70,6 +79,23 @@ def list_requests(
 )
 def get_request(request_id: UUID, repository: Repository) -> RequestRecord:
     return repository.get(str(request_id))
+
+
+@router.post(
+    "/{request_id}/retry",
+    status_code=202,
+    response_model=Receipt,
+    summary="Повторить обработку заявки после ошибки",
+    response_description="Идентификатор и состояние заявки",
+)
+def retry_processing(request_id: UUID, request: Request, repository: Repository) -> Receipt:
+    settings = request.app.state.settings
+    if not settings.ai_enabled:
+        raise ServiceError(503, "agent_disabled", "AI processing is disabled")
+    record = repository.get(str(request_id))
+    agent_input(record.payload, record.source, settings)
+    record = repository.retry_processing(str(request_id), settings.ai_queue_limit)
+    return Receipt(request_id=record.id, status=record.status, duplicate=False)
 
 
 @router.post(

@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 class RequestStatus(StrEnum):
     RECEIVED = "received"
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    PROCESSING_FAILED = "processing_failed"
     RESULT_READY = "result_ready"
     SENDING = "sending"
     DELIVERED = "delivered"
@@ -17,7 +20,10 @@ class RequestStatus(StrEnum):
 class CreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     external_id: str | None = Field(default=None, min_length=1, max_length=200)
-    data: dict[str, JsonValue] = Field(min_length=1)
+    data: dict[str, JsonValue] = Field(
+        min_length=1,
+        examples=[{"description": "Заменить 1 неисправную розетку.", "images": []}],
+    )
 
 
 class RequestRecord(BaseModel):

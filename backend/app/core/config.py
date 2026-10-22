@@ -23,7 +23,13 @@ class Settings(BaseSettings):
     reload: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     database_path: Path = PROJECT_ROOT / "data" / "requests.sqlite3"
-    max_request_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    max_request_bytes: int = Field(default=10_485_760, ge=1024, le=10_485_760)
+    ai_enabled: bool = True
+    ai_poll_seconds: float = Field(default=0.5, gt=0, le=30)
+    ai_queue_limit: int = Field(default=100, ge=1, le=10000)
+    ai_env_file: Path = PROJECT_ROOT.parent / ".env"
+    bitrix_input_path: str = "data.FIELDS"
+
     api_key: SecretStr = SecretStr("")
     bitrix_outbound_token: SecretStr = SecretStr("")
     bitrix_entity_id_path: str = "data.FIELDS.ID"
@@ -33,6 +39,11 @@ class Settings(BaseSettings):
     bitrix_result_field: str = ""
     bitrix_result_static_params: dict[str, Any] = Field(default_factory=dict)
     bitrix_result_id_param: str = "id"
+
+    @field_validator("ai_env_file")
+    @classmethod
+    def resolve_ai_env_file(cls, value: Path) -> Path:
+        return value if value.is_absolute() else PROJECT_ROOT.parent / value
 
     @field_validator("database_path")
     @classmethod
