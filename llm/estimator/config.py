@@ -21,7 +21,11 @@ class EstimatorSettings(BaseSettings):
     # Лимиты длины ответа модели (в токенах) для двух этапов. Для Thinking-моделей их нужно
     # увеличить: рассуждение перед JSON занимает тысячи токенов.
     observation_max_tokens: int = 1500
-    selection_max_tokens: int = 2200
+    # Этап 2 возвращает и работы, и материалы к ним — ответ длиннее, чем раньше.
+    selection_max_tokens: int = 3000
+    # Этап 3: выбор товаров из прайсов — сколько кандидатов на потребность и лимит ответа.
+    material_candidates: int = 5
+    material_selection_max_tokens: int = 1500
 
 
 @lru_cache

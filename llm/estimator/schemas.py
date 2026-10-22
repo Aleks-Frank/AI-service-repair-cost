@@ -60,6 +60,19 @@ class Observations(StrictModel):
 # --- Этап 2: какие работы выбрать из кандидатов --------------------------------------
 
 
+class MaterialNeed(StrictModel):
+    """Материал, нужный для выполнения работы: что искать в прайсах и сколько на единицу работы."""
+
+    # Описание для поиска в прайсах: тип товара и известные характеристики, без артикулов и цен
+    # («розетка с заземлением скрытой установки белая», «лампа светодиодная E27»).
+    query: str = Field(min_length=3, max_length=200)
+    # Сколько материала на одну единицу работы (на 1 шт смены розетки — 1 розетка).
+    qty_per_work_unit: float = Field(gt=0, le=1000, allow_inf_nan=False)
+    # Базовая единица материала: штуки или метры.
+    unit: Literal["шт", "м"]
+    reason: str = Field(default="", max_length=300)
+
+
 class WorkChoice(StrictModel):
     """Выбранная работа: код расценки из кандидатов, обоснование и объём (если его можно установить)."""
 
@@ -73,6 +86,8 @@ class WorkChoice(StrictModel):
     quantity_source: Literal["description", "visible_count", "unknown"] = "unknown"
     quantity_evidence: str = Field(default="", max_length=500)
     image_numbers: list[int] = Field(default_factory=list, max_length=4)
+    # Основные материалы для работы (норм расхода нет — их предлагает модель).
+    materials: list[MaterialNeed] = Field(default_factory=list, max_length=5)
 
 
 class Selection(StrictModel):
@@ -82,6 +97,24 @@ class Selection(StrictModel):
     alternatives: list[WorkChoice] = Field(max_length=10)
     unmatched_works: list[str] = Field(max_length=8)
     assumptions: list[str] = Field(max_length=10)
+
+
+# --- Этап 3: какой именно товар взять для каждой потребности ----------------------------
+
+
+class MaterialChoice(StrictModel):
+    """Выбор товара для одной потребности: артикул из кандидатов или «подходящего нет»."""
+
+    need_id: str = Field(min_length=1, max_length=20)
+    # Артикул одного из кандидатов этой потребности; null — подходящего товара среди кандидатов нет.
+    article: str | None = Field(default=None, max_length=128)
+    reason: str = Field(default="", max_length=300)
+
+
+class MaterialSelection(StrictModel):
+    """Выбор товаров для всех потребностей сметы."""
+
+    choices: list[MaterialChoice] = Field(max_length=40)
 
 
 def parse_json_object(text: str) -> dict:

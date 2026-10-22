@@ -12,7 +12,11 @@
     Selection
         │
         ▼  код: проверка кодов и объёмов, стоимость = объём × цена из БД
-    смета (черновик)
+    работы сметы
+        │
+        ▼  этап «Материалы» (если передан поиск по прайсам): потребности из ответа этапа 2 ->
+        │  RAG по прайсам -> LLM выбирает товар -> код подбирает самого дешёвого поставщика
+    смета (черновик): работы + материалы
 """
 
 import io
@@ -21,10 +25,11 @@ import math
 
 from PIL import Image, ImageOps
 
-from rag.retriever import HybridRetriever
+from rag.retriever import HybridRetriever, MaterialRetriever
 from llm.estimator.candidates import find_candidates, match_unmatched
-from llm.estimator.estimate import make_estimate
+from llm.estimator.estimate import attach_materials, make_estimate
 from llm.estimator.llm_client import InputTooLong, LLMServiceClient, LLMServiceError
+from llm.estimator.materials import collect_needs, price_materials
 from llm.estimator.prompts import OBSERVATION_PROMPT, SELECTION_PROMPT
 from llm.estimator.schemas import Observations, Selection
 
@@ -63,7 +68,10 @@ def analyze_case(
     retriever: HybridRetriever,
     per_finding: int = 6,
     observation_max_tokens: int = 1500,
-    selection_max_tokens: int = 2200,
+    selection_max_tokens: int = 3000,
+    material_retriever: MaterialRetriever | None = None,
+    material_candidates: int = 5,
+    material_selection_max_tokens: int = 1500,
 ) -> tuple[dict, dict]:
     """Составляет черновик сметы по фотографиям одной заявки и необязательному описанию.
 
@@ -73,7 +81,10 @@ def analyze_case(
         llm — клиент LLM-сервиса;
         retriever — гибридный поиск RAG-модуля;
         per_finding — сколько кандидатов RAG брать на один дефект;
-        observation_max_tokens, selection_max_tokens — лимиты длины ответа модели на этапах 1 и 2.
+        observation_max_tokens, selection_max_tokens — лимиты длины ответа модели на этапах 1 и 2;
+        material_retriever — поиск по прайсам поставщиков; None — смета только по работам;
+        material_candidates — сколько товаров-кандидатов показывать модели на потребность;
+        material_selection_max_tokens — лимит ответа модели при выборе товаров.
     Возвращает: кортеж (смета, трассировка всех этапов — для разбора ошибок).
     """
     description = description.strip()
@@ -95,7 +106,7 @@ def analyze_case(
                 raise ValueError("Номера изображений выходят за пределы загруженных фото.")
 
     # --- Этап 1. Анализ фотографий. ---
-    logger.info("1/3 · Анализ фотографий…")
+    logger.info("1/4 · Анализ фотографий…")
     observations, observation_raw = llm.ask_json(
         OBSERVATION_PROMPT, {"description": description or None}, images,
         Observations, validate_observations, max_new_tokens=observation_max_tokens,
@@ -110,7 +121,7 @@ def analyze_case(
     # Если вход получился слишком длинным для модели — сокращаем число кандидатов на дефект.
     selection, selection_raw, candidates = None, [], []
     for limit in sorted({per_finding, 4, 3}, reverse=True):
-        logger.info("2/3 · Поиск расценок в RAG (по %s на дефект) и выбор работ…", limit)
+        logger.info("2/4 · Поиск расценок в RAG (по %s на дефект) и выбор работ…", limit)
         candidates = find_candidates(retriever, observations, per_finding=limit)
         if not candidates:
             selection = Selection(
@@ -133,9 +144,20 @@ def analyze_case(
         raise LLMServiceError("Заявка слишком объёмная для модели даже с 3 кандидатами на дефект. Разделите её по участкам.")
 
     # --- Этап 3. Сопоставление «работ без расценки», проверка и расчёт. ---
-    logger.info("3/3 · Проверка кодов, объёмов и расчёт стоимости…")
+    logger.info("3/4 · Проверка кодов, объёмов и расчёт стоимости…")
     trace.update(candidates=candidates, raw_selection=selection_raw, selection_model=selection.model_dump())
     auto_matched = match_unmatched(selection, candidates, retriever)
     trace.update(selection=selection.model_dump(), auto_matched=auto_matched)
-    # Сведения об автоматическом сопоставлении остаются только в trace.json, в смету не выводятся.
-    return make_estimate(selection, observations, candidates, description, len(images)), trace
+    # Сведения об автоматическом сопоставлении остаются только в трассировке, в смету не выводятся.
+    result = make_estimate(selection, observations, candidates, description, len(images))
+
+    # --- Этап 4. Материалы для принятых работ и самый дешёвый поставщик. ---
+    if material_retriever is not None:
+        logger.info("4/4 · Подбор материалов и поставщиков…")
+        needs = collect_needs(selection, result["works"])
+        lines, not_found, material_trace = price_materials(
+            needs, description, images, llm, material_retriever, material_candidates, material_selection_max_tokens,
+        )
+        trace.update(material_trace)
+        attach_materials(result, lines, not_found)
+    return result, trace

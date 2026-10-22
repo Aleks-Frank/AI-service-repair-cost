@@ -7,7 +7,8 @@ LLM на первом этапе для каждого дефекта форму
 """
 
 from rag.db import Rate
-from rag.retriever import HybridRetriever
+from rag.prices_db import Material
+from rag.retriever import HybridRetriever, MaterialRetriever
 from llm.estimator.schemas import Observations, Selection, WorkChoice
 
 # Минимальная оценка reranker'а, при которой «работа без расценки» сопоставляется с кандидатом.
@@ -97,9 +98,43 @@ def match_unmatched(selection: Selection, candidates: list[dict], retriever: Hyb
         selection.works.append(WorkChoice(
             finding_id=item["finding_ids"][0],
             work_id=item["work_id"],
-            # Обоснование — формулировка работы самой моделью; детали сопоставления — в trace.json.
+            # Обоснование — формулировка работы самой моделью; детали сопоставления — в трассировке.
             reason=text,
         ))
         matches.append({"text": text, "work_id": item["work_id"], "score": round(score, 3)})
     selection.unmatched_works = still_unmatched
     return matches
+
+
+def find_material_candidates(retriever: MaterialRetriever, needs: list[dict], per_need: int = 5) -> dict[str, list[dict]]:
+    """Подбирает кандидатов типа товара для каждой потребности в материалах.
+
+    Один и тот же товар у разных поставщиков (одинаковый артикул производителя) показывается
+    модели один раз: на этом шаге выбирается «какой товар», а «у кого дешевле» решает код позже.
+
+    Принимает:
+        retriever — поиск по прайсам;
+        needs — потребности из materials.collect_needs;
+        per_need — сколько разных товаров оставить на потребность.
+    Возвращает: {need_id: [кандидат-словарь]} — артикул, наименование, категория, базовая единица,
+        оценка поиска и id позиции в базе (для подбора поставщика).
+    """
+    result: dict[str, list[dict]] = {}
+    for need in needs:
+        unique: dict[str, dict] = {}
+        # Берём с запасом: часть результатов — тот же товар у других поставщиков.
+        for hit in retriever.search(need["query"], top_k=per_need * 3).hits:
+            material: Material = hit.item  # type: ignore[assignment]
+            if material.article_norm in unique or len(unique) >= per_need:
+                continue
+            unique[material.article_norm] = {
+                "material_id": material.id,
+                "article": material.article,
+                "name": material.name,
+                "category": material.category,
+                "unit": material.base_unit,
+                "supplier": material.supplier_code,
+                "retrieval_score": round(hit.rerank_score if hit.rerank_score is not None else hit.rrf_score, 4),
+            }
+        result[need["need_id"]] = list(unique.values())
+    return result

@@ -6,10 +6,10 @@
   * единица объёма совпадает с единицей расценки;
   * «смена» не дублируется отдельными «демонтажем» и «установкой» того же узла.
 Стоимость = объём × цена из БД. Если объём не подтверждён, сумма остаётся пустой (а не нулевой).
+Раздел «Материалы» добавляется функцией attach_materials (строки готовит llm/estimator/materials.py).
 """
 
 import csv
-import html
 import io
 import re
 from decimal import ROUND_HALF_UP, Decimal
@@ -219,21 +219,49 @@ def make_estimate(
         "subtotal_priced_lines_rub": subtotal,
         "selected_works_total_rub": subtotal if complete else None,
         "calculation_complete_for_selected_works": complete,
+        # Раздел «Материалы» заполняет attach_materials; без него смета — только работы.
+        "materials_priced": False,
+        "materials": [],
+        "materials_not_found": [],
+        "works_total_rub": subtotal,
+        "materials_total_rub": None,
+        "total_rub": subtotal,
     }
 
 
-# --- Экспорт -------------------------------------------------------------------------
+def attach_materials(result: dict, lines: list[dict], not_found: list[dict]) -> dict:
+    """Добавляет в смету раздел «Материалы», итоги и предупреждения по материалам.
 
+    Итог считается только по строкам, где известны и количество, и цена; строки без суммы
+    видны в смете, но в итог не входят (как и работы без подтверждённого объёма).
 
-def _ru_number(value: str | None) -> str:
-    """Форматирует сумму по-русски: «1 312,50»; пустое значение — «—».
-
-    Принимает: value — число строкой или None.
-    Возвращает: отформатированную строку.
+    Принимает:
+        result — смета из make_estimate (изменяется на месте);
+        lines — строки материалов из materials.price_materials;
+        not_found — потребности, для которых товар не подобран.
+    Возвращает: ту же смету.
     """
-    if value is None:
-        return "—"
-    return f"{Decimal(value):,.2f}".replace(",", " ").replace(".", ",")
+    priced = [line for line in lines if line["amount_rub"] is not None]
+    materials_total = money(sum((Decimal(line["amount_rub"]) for line in priced), Decimal("0"))) if priced else None
+    works_total = result["works_total_rub"]
+    parts = [Decimal(value) for value in (works_total, materials_total) if value is not None]
+    warnings = list(result["warnings"])
+    for line in lines:
+        warnings += [f"Материал «{line['need']}» ({line['work_id']}): {text}." for text in line["warnings"]]
+    for item in not_found:
+        warnings.append(f"Материал «{item['query']}» ({item['work_id']}) не подобран: {item['reason']}.")
+    result.update(
+        materials_priced=True,
+        materials=lines,
+        materials_not_found=not_found,
+        materials_total_rub=materials_total,
+        total_rub=money(sum(parts, Decimal("0"))) if parts else None,
+        warnings=list(dict.fromkeys(warnings)),
+    )
+    return result
+
+
+# --- Экспорт -------------------------------------------------------------------------
 
 
 def estimate_csv(result: dict) -> str:
@@ -259,45 +287,17 @@ def estimate_csv(result: dict) -> str:
     writer.writerow([])
     writer.writerow(["По рассчитанным основным позициям, руб.", result["subtotal_priced_lines_rub"] or "Не рассчитано"])
     writer.writerow(["Полный расчёт выбранных работ", "Да" if result["calculation_complete_for_selected_works"] else "Нет"])
+    if result["materials"] or result["materials_not_found"]:
+        writer.writerow([])
+        writer.writerow(["Материалы", "Работа", "Наименование", "Артикул", "Поставщик", "Нужно", "Ед.",
+                         "Купить", "Ед. цены", "Цена, руб.", "Сумма, руб.", "Дата цены", "Потребность"])
+        for line in result["materials"]:
+            writer.writerow([safe(v) for v in ("", line["work_id"], line["name"], line["article"], line["supplier"],
+                                               line["need_qty"], line["base_unit"], line["buy_qty"], line["price_unit"],
+                                               line["price_rub"], line["amount_rub"], line["price_date"], line["need"])])
+        for item in result["materials_not_found"]:
+            writer.writerow([safe(v) for v in ("Не подобран", item["work_id"], item["query"], "", "", "", item["unit"],
+                                               "", "", "", "", "", item["reason"])])
+        writer.writerow(["Материалы итого, руб.", result["materials_total_rub"] or "Не рассчитано"])
+        writer.writerow(["Всего (работы + материалы), руб.", result["total_rub"] or "Не рассчитано"])
     return "﻿" + output.getvalue()
-
-
-def estimate_html(result: dict) -> str:
-    """Формирует HTML-страницу сметы (открывается в браузере, печатается в PDF).
-
-    Принимает: result — смета из make_estimate.
-    Возвращает: HTML-документ строкой.
-    """
-    esc = lambda value: html.escape(str(value if value is not None else "—"))  # noqa: E731
-
-    def table(lines: list[dict]) -> str:
-        """Таблица работ: наименование с основанием, единица, объём, цена, сумма."""
-        rows = []
-        for line in lines:
-            source = f"{line['source_sheet'].strip()}, строка {line['source_row']}"
-            qty = esc(line["quantity"]) if line["quantity"] is not None else '<span class="missing">Не определён</span>'
-            details = f"<details><summary>Основание и состав</summary><p>{esc(line['reason'])}</p><p>{esc(line['composition'])}</p>"
-            if line["quantity_evidence"]:
-                details += f"<p>Объём: {esc(line['quantity_evidence'])}</p>"
-            details += "</details>"
-            note = f'<p class="note">{esc(line["note"])}</p>' if line["note"] else ""
-            rows.append(
-                f"<tr><td><strong>{esc(line['name'])}</strong><small>{esc(line['work_id'])} · {esc(source)}</small>{details}{note}</td>"
-                f"<td>{esc(line['unit'])}</td><td>{qty}</td><td>{_ru_number(line['unit_price_rub'])}</td><td>{_ru_number(line['amount_rub'])}</td></tr>"
-            )
-        return ('<div class="scroll"><table><thead><tr><th>Работа</th><th>Ед.</th><th>Объём</th><th>Цена, ₽</th>'
-                "<th>Сумма, ₽</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
-
-    main = table(result["works"]) if result["works"] else "<p>Подходящие позиции не выбраны. Автоматический расчёт не выполнен.</p>"
-    total_label = "По выбранным работам" if result["calculation_complete_for_selected_works"] else "По позициям с известным объёмом"
-    notices = "".join(f"<li>{esc(t)}</li>" for t in result["unknowns"] + result["assumptions"] + result["warnings"])
-    alt = "<h2>Альтернативы — не входят в сумму</h2>" + table(result["alternatives"]) if result["alternatives"] else ""
-    unmatched = ("<h2>Без расценки</h2><ul>" + "".join(f"<li>{esc(t)}</li>" for t in result["unmatched_works"]) + "</ul>"
-                 if result["unmatched_works"] else "")
-    return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Проект сметы ПЗР</title>
-<style>body{{font:16px/1.55 system-ui,sans-serif;color:#182b43;background:#edf2f8;margin:0;padding:28px}}main{{max-width:1120px;margin:auto;background:white;padding:32px;border-radius:16px}}h1{{font-size:30px;margin:6px 0 16px}}h2{{font-size:20px;margin-top:30px}}.eyebrow{{color:#155bc8;font-weight:700;font-size:14px}}.scroll{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;font-size:14px}}th{{text-align:left;background:#eaf0f8;padding:12px}}td{{padding:14px 12px;vertical-align:top;border-bottom:1px solid #dce4ee}}td:first-child{{min-width:260px}}td:nth-child(n+3){{text-align:right;white-space:nowrap}}small{{display:block;color:#62748c;margin-top:5px}}details{{font-size:13px;margin-top:8px}}summary{{cursor:pointer;color:#155bc8}}.missing,.note{{color:#8c5c16}}.note{{font-size:13px}}.total{{padding:20px;background:#edf4ff;border-left:4px solid #155bc8;margin:24px 0;font-size:20px}}.muted{{color:#62748c}}@media print{{body{{background:white;padding:0}}main{{padding:0}}details{{display:none}}}}</style>
-<main><div class="eyebrow">ПЗР · АВТОМАТИЧЕСКИЙ ЧЕРНОВИК</div><h1>Проект сметы</h1><p>{esc(result['summary'])}</p>
-{main}<div class="total">{total_label}: <strong>{_ru_number(result['subtotal_priced_lines_rub'])} ₽</strong></div>
-<p class="muted">Материалы не рассчитаны. Фото не подтверждают фактическое выполнение всех операций.</p>
-{alt}{unmatched}{'<h2>Неопределённости и допущения</h2><ul>' + notices + '</ul>' if notices else ''}
-<p class="muted">Источник расценок: справочник ПЗР в базе pzr_pricing.</p></main></html>"""
