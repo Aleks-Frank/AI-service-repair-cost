@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from rag.db import Rate
 from rag.ml_client import MLServiceClient
 from rag.parser import ParsedRate, parse_price_book
-from rag.price_list_parser import parse_price_list
+from rag.price_list_parser import extract_params, normalize_article, parse_price_list
 from rag.prices_db import Material, Supplier
 
 logger = logging.getLogger(__name__)
@@ -73,16 +73,24 @@ def load_price_book(session: Session, path: str | Path, models: MLServiceClient)
     return summary
 
 
-def load_price_list(session: Session, path: str | Path, supplier_code: str, models: MLServiceClient) -> dict[str, Any]:
+def load_price_list(
+    session: Session,
+    path: str | Path,
+    supplier_code: str,
+    models: MLServiceClient,
+    article_is_manufacturer: bool = True,
+) -> dict[str, Any]:
     """Загружает прайс-лист поставщика в базу supplier_prices.
 
     Заменяются позиции только этого поставщика: прайсы остальных не трогаются.
+    Настройки поставщика (активность, приоритет, НДС) при повторной загрузке сохраняются.
 
     Принимает:
         session — сессия базы прайсов;
         path — путь к .xls/.xlsx;
         supplier_code — код поставщика по названию компании латиницей («ros_elektro»);
-        models — ML-сервис (нужен метод embed).
+        models — ML-сервис (нужен метод embed);
+        article_is_manufacturer — артикулы в прайсе — коды производителя (False — свои коды поставщика).
     Возвращает: сводку разбора.
     """
     # --- 1. Разбор файла. ---
@@ -100,22 +108,29 @@ def load_price_list(session: Session, path: str | Path, supplier_code: str, mode
         price_date=result.price_date,
         source_file=Path(path).name,
         loaded_at=func.now(),
+        article_is_manufacturer=article_is_manufacturer,
     ))
     session.execute(delete(Material).where(Material.supplier_code == supplier_code))
     session.add_all(
         Material(
             supplier_code=supplier_code,
             article=item.article,
+            article_norm=normalize_article(item.article),
             name=item.name,
             brand=item.brand,
             category=item.category,
             unit=item.unit,
             unit_raw=item.unit_raw,
             price=item.price,
+            base_unit=item.pricing[0],
+            units_per_price_unit=item.pricing[1],
+            base_price=item.base_price,
+            sold_by_pack=item.pricing[2],
             stock=item.stock,
             on_sale=item.on_sale,
             pack_size=item.pack_size,
             pack_unit=item.pack_unit,
+            params=extract_params(item.name),
             source_row=item.source_row,
             search_text=item.search_text,
             embedding=vector,
