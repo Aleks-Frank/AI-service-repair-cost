@@ -11,6 +11,46 @@
 name: ai-smetchik
 
 services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      RELOAD: "false"
+      AI_ENABLED: "true"
+      MAX_REQUEST_BYTES: 10485760
+      DATABASE_PATH: /service/backend/data/requests.sqlite3
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-smeta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smeta}
+      POSTGRES_DB: ${POSTGRES_DB:-pzr_pricing}
+      ML_SERVICE_URL: http://ml_service:8000
+      LLM_SERVICE_URL: http://llm_service:8000
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - requests_data:/service/backend/data
+    depends_on:
+      db:
+        condition: service_healthy
+      ml_service:
+        condition: service_healthy
+      llm_service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
   db:
     # Официальный образ проекта pgvector: обычный Postgres со встроенным расширением vector.
     image: pgvector/pgvector:pg17
@@ -122,5 +162,6 @@ services:
       start_period: 300s
 
 volumes:
+  requests_data:
   pgdata:
   prices_pgdata:

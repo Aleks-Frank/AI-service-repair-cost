@@ -1,3 +1,16 @@
-# В контекст сборки образов нужны только папки сервисов.
 *
 !ml_service
+!requirements.txt
+!pyproject.toml
+!rag
+!llm
+llm/*
+!llm/estimator
+!backend
+backend/*
+!backend/app
+!backend/pyproject.toml
+!backend/requirements.lock.txt
+**/__pycache__
+**/*.pyc
+**/.env

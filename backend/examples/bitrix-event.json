@@ -1,7 +1,11 @@
 {
   "event": "ONCRMDEALADD",
   "data": {
-    "FIELDS": {"ID": "42"}
+    "FIELDS": {
+      "ID": "42",
+      "description": "Протечка трубы в подвале",
+      "images": []
+    }
   },
   "ts": "1791500000",
   "auth": {
