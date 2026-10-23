@@ -32,7 +32,7 @@ class LLMServiceClient:
             timeout_s — таймаут одного запроса (генерация длинного JSON занимает минуты).
         Возвращает: ничего.
         """
-        self._http = httpx.Client(base_url=base_url, timeout=timeout_s)
+        self._http = httpx.Client(base_url=base_url, timeout=timeout_s, trust_env=False)
 
     def close(self) -> None:
         self._http.close()

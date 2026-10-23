@@ -34,12 +34,17 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-pzr_pricing}
       ML_SERVICE_URL: http://ml_service:8000
       LLM_SERVICE_URL: http://llm_service:8000
+      PRICES_HOST: prices_db
+      PRICES_PORT: 5432
+      PRICES_DB: ${PRICES_DB:-supplier_prices}
     ports:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     volumes:
       - requests_data:/service/backend/data
     depends_on:
       db:
+        condition: service_healthy
+      prices_db:
         condition: service_healthy
       ml_service:
         condition: service_healthy
@@ -108,7 +113,7 @@ services:
     volumes:
       # Веса моделей (~4,5 ГБ) берутся из кэша на хосте: скачиваются один раз
       # и переживают пересборку образа.
-      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/hf-cache
+      - ${HF_CACHE_DIR:-./data/hf-cache}:/hf-cache
     ports:
       - "127.0.0.1:${ML_PORT:-8001}:8000"
     deploy:
@@ -144,7 +149,7 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
-      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/hf-cache
+      - ${HF_CACHE_DIR:-./data/hf-cache}:/hf-cache
     ports:
       - "127.0.0.1:${LLM_PORT:-8002}:8000"
     deploy:

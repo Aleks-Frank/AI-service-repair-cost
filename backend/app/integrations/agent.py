@@ -110,12 +110,25 @@ class EstimatorAgent:
             connect_args={"connect_timeout": 10, "options": "-c statement_timeout=60000"},
         )
         self.sessions = sessionmaker(bind=self.engine, expire_on_commit=False)
+        self.prices_engine = create_engine(
+            URL.create(
+                "postgresql+psycopg",
+                username=self.rag.postgres_user,
+                password=self.rag.postgres_password,
+                host=self.rag.prices_host,
+                port=self.rag.prices_port,
+                database=self.rag.prices_db,
+            ),
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": 10, "options": "-c statement_timeout=60000"},
+        )
+        self.prices_sessions = sessionmaker(bind=self.prices_engine, expire_on_commit=False)
 
     def __call__(self, data: AgentInput) -> dict:
         from llm.estimator.llm_client import InputTooLong, LLMServiceClient, LLMServiceError
         from llm.estimator.pipeline import analyze_case, prepare_image
         from rag.ml_client import MLServiceError, build_ml_client
-        from rag.retriever import HybridRetriever
+        from rag.retriever import HybridRetriever, MaterialRetriever
         from sqlalchemy.exc import SQLAlchemyError
 
         try:
@@ -131,6 +144,7 @@ class EstimatorAgent:
                 ml = build_ml_client(self.rag)
                 stack.callback(ml.close)
                 session = stack.enter_context(self.sessions())
+                prices_session = stack.enter_context(self.prices_sessions())
                 result, _ = analyze_case(
                     images,
                     data.description_with_context(),
@@ -139,6 +153,9 @@ class EstimatorAgent:
                     self.estimator.candidates_per_finding,
                     self.estimator.observation_max_tokens,
                     self.estimator.selection_max_tokens,
+                    material_retriever=MaterialRetriever(prices_session, ml, self.rag),
+                    material_candidates=self.estimator.material_candidates,
+                    material_selection_max_tokens=self.estimator.material_selection_max_tokens,
                 )
                 return result
         except InputTooLong:
@@ -152,3 +169,4 @@ class EstimatorAgent:
 
     def close(self) -> None:
         self.engine.dispose()
+        self.prices_engine.dispose()

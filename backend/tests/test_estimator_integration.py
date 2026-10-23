@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+from datetime import date
 from decimal import Decimal
 
 import httpx
@@ -9,6 +10,7 @@ from llm.estimator.llm_client import LLMServiceClient
 from PIL import Image
 from rag.db import Rate
 from rag.ml_client import MLServiceClient
+from rag.prices_db import Material, Supplier
 from sqlalchemy.exc import OperationalError
 
 from app.core.config import Settings
@@ -66,7 +68,7 @@ def pipeline(monkeypatch, tmp_path):
         source_row=7,
         search_text="Смена розеток",
     )
-    state = {"calls": [], "clients": [], "sessions": [], "failure": None}
+    state = {"calls": [], "clients": [], "sessions": [], "failure": None, "materials": False}
 
     def handle(request):
         body = json.loads(request.content)
@@ -78,6 +80,17 @@ def pipeline(monkeypatch, tmp_path):
                 return httpx.Response(200, json={"text": "invalid answer"})
             prompt = body["user_prompt"]
             answer = selection if '"CANDIDATES"' in prompt else observations
+            if state["materials"]:
+                selection["works"][0]["materials"] = [
+                    {
+                        "query": "Розетка с заземлением",
+                        "qty_per_work_unit": 3,
+                        "unit": "шт",
+                        "reason": "Тестовая потребность",
+                    }
+                ]
+            if '"NEEDS"' in prompt:
+                answer = {"choices": [{"need_id": "m1", "article": "ABC", "reason": "Подходит"}]}
             return httpx.Response(200, json={"text": json.dumps(answer, ensure_ascii=False)})
         if state["failure"] == "ml":
             return httpx.Response(503, json={"detail": "secret detail"})
@@ -133,8 +146,66 @@ def pipeline(monkeypatch, tmp_path):
             pass
 
     settings = Settings(_env_file=None, ai_env_file=tmp_path / "absent.env")
+    suppliers = [
+        Supplier(
+            code=code,
+            name=code,
+            active=True,
+            article_is_manufacturer=True,
+            priority=0,
+            price_valid_days=30,
+            price_date=date.today(),
+        )
+        for code in ("first", "second")
+    ]
+    materials = [
+        Material(
+            id=index,
+            supplier_code=supplier,
+            article="ABC",
+            article_norm="abc",
+            name="Розетка",
+            category="Электрика",
+            unit=unit,
+            unit_raw=unit,
+            price=Decimal(price),
+            base_unit="шт",
+            base_price=Decimal(base_price),
+            units_per_price_unit=Decimal(pack),
+            sold_by_pack=packed,
+            stock=Decimal("100"),
+            params={},
+            search_text="Розетка",
+            source_row=9,
+        )
+        for index, supplier, unit, price, base_price, pack, packed in (
+            (7, "first", "шт", "10", "10", "1", False),
+            (8, "second", "уп", "7.50", "1.50", "5", True),
+        )
+    ]
+
+    class PricesSession(Session):
+        def execute(self, statement, params=None):
+            if state["failure"] == "prices_db":
+                raise OperationalError("query", {}, RuntimeError("secret detail"))
+            return self
+
+        def all(self):
+            return [{**super().all()[0], "id": 7}]
+
+        def scalars(self, statement):
+            if statement.column_descriptions[0]["entity"] is Supplier:
+                return suppliers
+            if "materials.supplier_code !=" in str(statement):
+                return [materials[1]]
+            return [materials[0]]
+
+        def get(self, model, primary_key):
+            return next(item for item in materials if item.id == primary_key)
+
     agent = EstimatorAgent(settings)
     agent.sessions = Session
+    agent.prices_sessions = PricesSession
     state["agent"] = agent
     return state
 
@@ -201,3 +272,39 @@ def test_real_adapter_translates_dependency_errors(
     assert all(client.is_closed for client in pipeline["clients"])
     assert all(session.closed for session in pipeline["sessions"])
     assert "secret detail" not in caplog.text
+
+
+def test_api_prices_materials_selects_supplier_and_rounds_packages(
+    client_factory, headers, pipeline
+):
+    pipeline["materials"] = True
+    client = client_factory(agent=pipeline["agent"], ai_enabled=True, ai_poll_seconds=0.01)
+    response = client.post(
+        "/api/v1/requests", headers=headers, json={"data": {"description": "Заменить 1 розетку."}}
+    )
+    record = wait_for_status(client, headers, response.json()["request_id"], "result_ready")
+    result = record["result"]
+    assert result["materials_priced"] is True
+    assert result["materials_not_found"] == []
+    material = result["materials"][0]
+    assert material["supplier"] == "second"
+    assert material["need_qty"] == "3"
+    assert material["buy_qty"] == "1"
+    assert material["amount_rub"] == "7.50"
+    assert result["works_total_rub"] == "125.50"
+    assert result["materials_total_rub"] == "7.50"
+    assert result["total_rub"] == "133.00"
+    assert sum(path == "/generate" for path, _ in pipeline["calls"]) == 3
+    assert all(client.is_closed for client in pipeline["clients"])
+    assert all(session.closed for session in pipeline["sessions"])
+
+
+def test_material_database_failure_is_visible(client_factory, headers, pipeline):
+    pipeline.update(materials=True, failure="prices_db")
+    client = client_factory(agent=pipeline["agent"], ai_enabled=True, ai_poll_seconds=0.01)
+    response = client.post(
+        "/api/v1/requests", headers=headers, json={"data": {"description": "Заменить 1 розетку."}}
+    )
+    record = wait_for_status(client, headers, response.json()["request_id"], "processing_failed")
+    assert record["last_error"] == "rag_database_failed"
+    assert record["result"] is None
