@@ -11,7 +11,7 @@ WORKDIR /srv
 # torch ставим отдельным слоем с официального индекса PyTorch: он быстрее PyPI,
 # а отдельный слой не пересобирается при изменении остальных зависимостей.
 # Для сервера без GPU замените cu130 на cpu.
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 RUN --mount=type=cache,target=/root/.cache/pip pip install torch --index-url ${TORCH_INDEX}
 
 COPY ml_service/requirements.txt ./requirements.txt

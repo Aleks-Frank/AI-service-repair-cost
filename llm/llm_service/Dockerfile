@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev &
 WORKDIR /srv
 
 # torch с индекса PyTorch (из кэша сборки) + torchvision той же сборки: он нужен процессору Qwen3-VL.
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 RUN --mount=type=cache,target=/root/.cache/pip pip install torch torchvision --index-url ${TORCH_INDEX}
 
 COPY llm_service/requirements.txt ./requirements.txt

@@ -11,6 +11,26 @@
 name: ai-smetchik
 
 services:
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: ["tunnel", "--url", "http://frontend:8080"]
+    depends_on:
+      frontend:
+        condition: service_healthy
+
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+
   backend:
     build:
       context: .
@@ -41,6 +61,7 @@ services:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     volumes:
       - requests_data:/service/backend/data
+      - ./data/import:/service/import:ro
     depends_on:
       db:
         condition: service_healthy
@@ -102,6 +123,11 @@ services:
     container_name: ml_service
     restart: unless-stopped
     environment:
+      HOME: /tmp
+      USER: app
+      LOGNAME: app
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      TRITON_CACHE_DIR: /tmp/triton
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
       RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       DEVICE: ${DEVICE:-auto}
@@ -147,6 +173,11 @@ services:
       # Позволяет PyTorch переиспользовать фрагменты видеопамяти — меньше ошибок нехватки памяти
       # при генерациях с картинками разного размера.
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      HOME: /tmp
+      USER: app
+      LOGNAME: app
+      TORCHINDUCTOR_CACHE_DIR: /tmp/torchinductor
+      TRITON_CACHE_DIR: /tmp/triton
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ${HF_CACHE_DIR:-./data/hf-cache}:/hf-cache
@@ -165,6 +196,9 @@ services:
       timeout: 5s
       retries: 30
       start_period: 300s
+
+
+
 
 volumes:
   requests_data:

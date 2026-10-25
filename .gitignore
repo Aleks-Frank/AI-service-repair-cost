@@ -18,3 +18,5 @@ results/
 
 # Служебные файлы Windows
 *:Zone.Identifier
+
+*.xlsx
