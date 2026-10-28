@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from rag.db import Rate
 from rag.ml_client import MLServiceClient
 from rag.parser import ParsedRate, parse_price_book
-from rag.price_list_parser import extract_params, normalize_article, parse_price_list
+from rag.price_list_parser import ParsedMaterial, extract_params, normalize_article, parse_price_list
 from rag.prices_db import Material, Supplier
 
 logger = logging.getLogger(__name__)
@@ -73,24 +73,34 @@ def load_price_book(session: Session, path: str | Path, models: MLServiceClient)
     return summary
 
 
+# Сколько позиций прайса векторизовать и записывать за один шаг. Каталог магазина — сотни тысяч
+# позиций: векторы всех сразу (1024 числа на позицию) не помещаются в память.
+LOAD_CHUNK = 2000
+
+
 def load_price_list(
     session: Session,
     path: str | Path,
     supplier_code: str,
     models: MLServiceClient,
     article_is_manufacturer: bool = True,
+    supplier_name: str | None = None,
 ) -> dict[str, Any]:
     """Загружает прайс-лист поставщика в базу supplier_prices.
 
     Заменяются позиции только этого поставщика: прайсы остальных не трогаются.
     Настройки поставщика (активность, приоритет, НДС) при повторной загрузке сохраняются.
 
+    Позиции векторизуются и записываются пачками по LOAD_CHUNK, но в одной транзакции:
+    если загрузка прервётся, прежние позиции поставщика останутся.
+
     Принимает:
         session — сессия базы прайсов;
-        path — путь к .xls/.xlsx;
+        path — путь к .xls/.xlsx (выгрузка 1С) или .json (каталог магазина);
         supplier_code — код поставщика по названию компании латиницей («ros_elektro»);
         models — ML-сервис (нужен метод embed);
-        article_is_manufacturer — артикулы в прайсе — коды производителя (False — свои коды поставщика).
+        article_is_manufacturer — артикулы в прайсе — коды производителя (False — свои коды поставщика);
+        supplier_name — название поставщика; если не задано — из файла (шапка прайса или каталог).
     Возвращает: сводку разбора.
     """
     # --- 1. Разбор файла. ---
@@ -98,21 +108,37 @@ def load_price_list(
     summary = result.summary()
     logger.info("Разобрано: %s позиций, %s категорий", summary["materials"], summary["categories"])
 
-    # --- 2. Векторы для всех позиций. ---
-    vectors = models.embed([item.search_text for item in result.materials])
-
-    # --- 3. Поставщик (создаётся или обновляется) и замена его позиций одной транзакцией. ---
+    # --- 2. Поставщик (создаётся или обновляется) и удаление его прежних позиций. ---
     session.merge(Supplier(
         code=supplier_code,
-        name=result.supplier_name or supplier_code,
+        name=supplier_name or result.supplier_name or supplier_code,
         price_date=result.price_date,
         source_file=Path(path).name,
         loaded_at=func.now(),
         article_is_manufacturer=article_is_manufacturer,
     ))
     session.execute(delete(Material).where(Material.supplier_code == supplier_code))
-    session.add_all(
-        Material(
+
+    # --- 3. Векторы и запись позиций пачками; фиксация — одним commit в конце. ---
+    for start in range(0, len(result.materials), LOAD_CHUNK):
+        chunk = result.materials[start : start + LOAD_CHUNK]
+        vectors = models.embed([item.search_text for item in chunk])
+        session.add_all(_material_row(supplier_code, item, vector) for item, vector in zip(chunk, vectors, strict=True))
+        # flush отправляет строки в БД, expunge_all освобождает память от уже записанных объектов.
+        session.flush()
+        session.expunge_all()
+        logger.info("Записано %s из %s позиций", min(start + LOAD_CHUNK, len(result.materials)), len(result.materials))
+    session.commit()
+    return summary
+
+
+def _material_row(supplier_code: str, item: ParsedMaterial, vector: list[float]) -> Material:
+    """Превращает позицию прайса и её вектор в строку таблицы materials.
+
+    Принимает: supplier_code — код поставщика; item — ParsedMaterial; vector — эмбеддинг позиции.
+    Возвращает: ORM-объект Material (ещё не сохранённый).
+    """
+    return Material(
             supplier_code=supplier_code,
             article=item.article,
             article_norm=normalize_article(item.article),
@@ -135,7 +161,3 @@ def load_price_list(
             search_text=item.search_text,
             embedding=vector,
         )
-        for item, vector in zip(result.materials, vectors, strict=True)
-    )
-    session.commit()
-    return summary

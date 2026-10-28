@@ -22,7 +22,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from rag.price_list_parser import CRITICAL_PARAMS, params_match
+from rag.price_list_parser import CRITICAL_PARAMS, model_tokens, models_match, params_match, product_type
 from rag.prices_db import Material, Supplier
 from rag.retriever import MaterialRetriever
 
@@ -51,12 +51,16 @@ class Offer:
         """Хватает ли остатка поставщика на потребность.
 
         Остаток в прайсе указан в единицах цены (комплектах), потребность — в базовых (штуках).
+        Если поставщик остатки не передаёт (stock = None), товар не считается отсутствующим:
+        неизвестный остаток — не то же самое, что нулевой.
 
         Принимает: need_base_qty — потребность в базовых единицах (None — неизвестна, хватит любого остатка).
-        Возвращает: True, если остаток покрывает потребность.
+        Возвращает: True, если остаток покрывает потребность или неизвестен.
         """
         stock = self.material.stock
-        if not stock or stock <= 0:
+        if stock is None:
+            return True
+        if stock <= 0:
             return False
         return need_base_qty is None or stock * self.material.units_per_price_unit >= need_base_qty
 
@@ -106,13 +110,18 @@ def find_offers(retriever: MaterialRetriever, reference: Material) -> list[Offer
         has_critical = any(key in reference.params for key in CRITICAL_PARAMS)
         threshold = NAME_MATCH_THRESHOLD_WITH_PARAMS if has_critical else NAME_MATCH_THRESHOLD
         hits = retriever.search(reference.name, top_k=NAME_MATCH_CANDIDATES, suppliers=remaining).hits
+        reference_models = model_tokens(reference.name, reference.brand)
+        reference_type = product_type(reference.name)
         best: dict[str, Offer] = {}
         for hit in hits:
             material: Material = hit.item  # type: ignore[assignment]
             score = hit.rerank_score or 0.0
-            # Тот же товар: высокая оценка, та же базовая единица и те же размеры/ток/мощность.
+            # Тот же товар: высокая оценка, тот же тип изделия, та же единица, те же размеры/ток/мощность
+            # и та же модель.
             if (score >= threshold and material.base_unit == reference.base_unit
-                    and params_match(reference.params, material.params)):
+                    and product_type(material.name) == reference_type
+                    and params_match(reference.params, material.params)
+                    and models_match(reference_models, model_tokens(material.name, material.brand))):
                 current = best.get(material.supplier_code)
                 if current is None or score > (current.match_score or 0):
                     best[material.supplier_code] = Offer(material, suppliers[material.supplier_code], "name", round(score, 3))

@@ -64,7 +64,7 @@ _MATERIAL_FILTERS = """
     r.supplier_code IN (SELECT code FROM suppliers WHERE active)
     AND (CAST(:suppliers AS text[]) IS NULL OR r.supplier_code = ANY(CAST(:suppliers AS text[])))
     AND (CAST(:units AS text[]) IS NULL OR r.unit = ANY(CAST(:units AS text[])))
-    AND (NOT :in_stock_only OR r.stock > 0)
+    AND (NOT :in_stock_only OR r.stock IS NULL OR r.stock > 0)
 """
 
 
@@ -78,7 +78,6 @@ def _hybrid_sql(table: str, filters: str) -> str:
     return f"""
 WITH q AS (
     SELECT
-        CAST(:query_vector AS vector) AS qvec,
         -- plainto_tsquery даёт запрос с логическим И («отвал & плитк & подъезд»):
         -- длинное описание дефекта почти никогда не совпадёт целиком. Меняем И на ИЛИ,
         -- а ts_rank сам поднимет документы, где совпало больше слов.
@@ -86,10 +85,13 @@ WITH q AS (
 ),
 dense_top AS (
     -- Ветка 1: ближайшие векторы. <=> — косинусное расстояние (0 — полное совпадение).
-    SELECT r.id, r.embedding <=> q.qvec AS distance
-    FROM {table} r, q
+    -- Вектор запроса подставлен прямо в ORDER BY: только так Postgres использует HNSW-индекс.
+    -- Если взять его из CTE (q.qvec), индекс не применяется и сортируется вся таблица
+    -- (на 350 тыс. позиций прайсов — ~1,3 с вместо миллисекунд).
+    SELECT r.id, r.embedding <=> CAST(:query_vector AS vector) AS distance
+    FROM {table} r
     WHERE {filters}
-    ORDER BY r.embedding <=> q.qvec
+    ORDER BY r.embedding <=> CAST(:query_vector AS vector)
     LIMIT :per_branch
 ),
 dense AS (
@@ -317,7 +319,7 @@ class MaterialRetriever(_HybridSearch):
             use_reranker — переранжировать ли результаты через ML-сервис;
             suppliers — фильтр по кодам поставщиков («ros_elektro»); None — все поставщики;
             units — фильтр по единицам измерения;
-            in_stock_only — только позиции с ненулевым остатком.
+            in_stock_only — без позиций с нулевым остатком (неизвестный остаток допускается).
         Возвращает: SearchResult с позициями по убыванию релевантности (hit.item — Material).
         """
         filters = {"suppliers": suppliers, "units": units, "in_stock_only": in_stock_only}

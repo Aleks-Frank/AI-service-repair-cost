@@ -1,8 +1,15 @@
-"""Парсер прайс-листа поставщика материалов (выгрузка из 1С, xls или xlsx).
+"""Парсер прайс-листов поставщиков материалов: выгрузки из 1С (xls/xlsx) и каталоги магазинов (json).
 
 Как и парсер ПЗР, ничего не знает о базе: на входе файл, на выходе PriceListResult.
 
-Ожидаемая структура (как в «прайс для сервисной компании.xls» от «Р.О.С. электро»):
+Формат JSON (каталоги «Строительный двор», «Кувалда», «Лемана Про»):
+    {"generation_date", "shop": {...}, "products": [{"article_code", "vendor_code"?, "name",
+     "breadcrumbs"?, "brand"?, "specifications"?, "cities": [{"city_name",
+     "price": {"date", "price"}, "stock"?: [{"type": "all", "count"}, ...]}]}]}
+    Единиц измерения в каталогах нет — цена считается за штуку; остаток берётся из записи
+    «all», если магазин его передаёт, иначе остаток неизвестен.
+
+Ожидаемая структура xls (как в «прайс для сервисной компании.xls» от «Р.О.С. электро»):
     шапка    — название поставщика («ООО "…"») и строка «Цены указаны на ДД.ММ.ГГГГ»;
     заголовок — строка с колонкой «…Артикул»; колонки ищутся по словам, а не по буквам:
                «Номенклатура», «Артикул», «Остаток», «Распродажа», «Цена», «Ед.»;
@@ -12,10 +19,11 @@
 Другой поставщик с другими заголовками колонок потребует дописать слова в _COLUMNS.
 """
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -153,6 +161,56 @@ def extract_params(name: str) -> dict[str, list[str]]:
     return params
 
 
+# Обозначение модели: слово с латинскими буквами («Colour», «Como», «C35», «VTM.303»).
+_MODEL_TOKEN_RE = re.compile(r"(?<![\w])[A-Za-z0-9][A-Za-z0-9.\-/]*[A-Za-z][A-Za-z0-9.\-/]*|(?<![\w])[A-Za-z][A-Za-z0-9.\-/]*")
+# Латинские слова, которые не отличают модели: единицы, цоколи, степень защиты, общие слова.
+_NOT_MODEL = {"led", "ip", "w", "v", "k", "mm", "cm", "rgb", "white", "black", "pro", "max", "mini"}
+
+
+def model_tokens(name: str, brand: str | None) -> set[str]:
+    """Обозначения модели в наименовании — латинские слова, кроме бренда, цоколя и общих слов.
+
+    Пример: «Раковина Cersanit Colour керамика 50 см» (бренд Cersanit) -> {"colour"}.
+
+    Принимает: name — наименование; brand — бренд позиции (может быть None).
+    Возвращает: множество обозначений в нижнем регистре.
+    """
+    params = extract_params(name)
+    skip = {value.lower() for key in ("socket", "ip") for value in params.get(key, [])} | _NOT_MODEL
+    if brand:
+        skip |= {word.lower() for word in re.findall(r"[A-Za-z0-9]+", brand)}
+    tokens = {token.lower().strip(".-/") for token in _MODEL_TOKEN_RE.findall(name)}
+    return {token for token in tokens if token and token not in skip and not token.startswith("ip")}
+
+
+def product_type(name: str) -> str | None:
+    """Тип изделия — первое русское слово наименования (без аббревиатур в верхнем регистре).
+
+    «РКС-20-30-П-К Розетка с з/к» -> «розет»; «Разъем РШ-ВШ 32-002» -> «разъе»; «VEGA Роз. …» -> «розет».
+    Сравниваются первые 5 букв, чтобы «розетка» и «розетки» совпадали.
+
+    Принимает: name — наименование позиции.
+    Возвращает: начало слова-типа в нижнем регистре или None.
+    """
+    for word in re.findall(r"[А-ЯЁа-яё]{3,}", expand_abbreviations(name)):
+        if not word.isupper():
+            return word.lower().replace("ё", "е")[:5]
+    return None
+
+
+def models_match(reference: set[str], candidate: set[str]) -> bool:
+    """Проверяет, что обозначения моделей не противоречат друг другу.
+
+    Если у обоих товаров есть обозначения модели, нужно хотя бы одно общее: «Colour» и «Como»
+    одного бренда — разные раковины. Если у одного из товаров обозначений нет, проверка не
+    применяется (название могло быть сокращено).
+
+    Принимает: reference, candidate — результаты model_tokens.
+    Возвращает: True, если товары можно считать одной моделью.
+    """
+    return not (reference and candidate) or bool(reference & candidate)
+
+
 def params_match(reference: dict[str, list[str]], candidate: dict[str, list[str]]) -> bool:
     """Проверяет, что у кандидата те же ключевые параметры, что и у эталона.
 
@@ -188,18 +246,24 @@ class ParsedMaterial:
     pack_size: Decimal | None
     pack_unit: str | None
     source_row: int
+    # Характеристики из каталога магазина («Цвет: белый; Диаметр: 25 мм»); у прайсов 1С пусто.
+    details: str = ""
 
     @property
     def search_text(self) -> str:
-        """Текст для поиска: наименование с раскрытыми сокращениями и путь категории.
+        """Текст для поиска: наименование с раскрытыми сокращениями, путь категории и характеристики.
 
         Цена и поставщик не входят: они не описывают сам материал.
 
         Принимает: ничего.
         Возвращает: строку для модели эмбеддингов и reranker'а.
         """
-        name = expand_abbreviations(self.name)
-        return f"{name}\nКатегория: {self.category}" if self.category else name
+        parts = [expand_abbreviations(self.name)]
+        if self.category:
+            parts.append(f"Категория: {self.category}")
+        if self.details:
+            parts.append(f"Характеристики: {self.details}")
+        return "\n".join(parts)
 
     @property
     def pricing(self) -> tuple[str, Decimal, bool]:
@@ -363,12 +427,23 @@ def _pack(name: str) -> tuple[Decimal | None, str | None]:
 
 
 def parse_price_list(path: str | Path) -> PriceListResult:
-    """Разбирает прайс-лист поставщика.
+    """Разбирает прайс-лист поставщика: выгрузку из 1С (.xls/.xlsx) или каталог магазина (.json).
 
-    Принимает: path — путь к .xls/.xlsx.
+    Принимает: path — путь к файлу.
     Возвращает: PriceListResult с позициями и пропущенными строками.
     """
     path = Path(path)
+    if path.suffix.lower() == ".json":
+        return _parse_shop_json(path)
+    return _parse_spreadsheet(path)
+
+
+def _parse_spreadsheet(path: Path) -> PriceListResult:
+    """Разбирает выгрузку прайса из 1С (структура описана в начале модуля).
+
+    Принимает: path — путь к .xls/.xlsx.
+    Возвращает: PriceListResult.
+    """
     rows = _read_rows(path)
     header_index, columns = _find_header(rows)
     supplier, price_date = _header_info(rows[:header_index])
@@ -421,11 +496,103 @@ def parse_price_list(path: str | Path) -> PriceListResult:
             unit=normalize_unit(unit_raw),
             unit_raw=unit_raw or "",
             price=price,
-            stock=to_decimal(cell(values, "stock")),
+            # Колонка «Остаток» есть, но ячейка пуста — товара нет на складе (0).
+            # Колонки нет вовсе — остаток неизвестен (None).
+            stock=(to_decimal(cell(values, "stock")) or Decimal(0)) if "stock" in columns else None,
             # В колонке «Распродажа» стоит «***», если позиция продаётся только из наличия.
             on_sale=bool(clean_text(cell(values, "sale"))),
             pack_size=pack_size,
             pack_unit=pack_unit,
             source_row=row_number,
+        ))
+    return result
+
+
+# Служебные пункты «хлебных крошек» каталога, которые не являются категориями.
+_BREADCRUMB_SKIP = {"главная", "каталог"}
+# Сколько символов характеристик включать в текст для поиска (длинные описания только мешают).
+_DETAILS_LIMIT = 400
+
+
+def _city_offer(cities: list[dict]) -> tuple[Decimal | None, Decimal | None]:
+    """Выбирает цену и остаток из записей по городам: запись с ценой и самой свежей датой цены.
+
+    Принимает: cities — список записей товара по городам из каталога.
+    Возвращает: (цена или None, остаток или None — если магазин остатки не передаёт).
+    """
+    priced = [c for c in cities if (c.get("price") or {}).get("price")]
+    if not priced:
+        return None, None
+    best = max(priced, key=lambda c: c["price"].get("date") or "")
+    stock_rows = best.get("stock") or []
+    total = next((s.get("count") for s in stock_rows if s.get("type") == "all"), None)
+    if total is None and stock_rows:
+        total = sum(s.get("count") or 0 for s in stock_rows)
+    return to_decimal(best["price"]["price"]), to_decimal(total) if stock_rows else None
+
+
+def _parse_shop_json(path: Path) -> PriceListResult:
+    """Разбирает каталог интернет-магазина в формате JSON (структура описана в начале модуля).
+
+    Артикул — vendor_code, если он есть, иначе код товара в магазине (article_code). Это коды
+    магазина, а не производителя, поэтому такие каталоги загружаются с флагом --own-articles.
+    Категория — «хлебные крошки» без служебных пунктов и бренда.
+
+    Принимает: path — путь к .json.
+    Возвращает: PriceListResult.
+    """
+    with path.open(encoding="utf-8") as file:
+        data = json.load(file)
+    generated = data.get("generation_date")
+    price_date = datetime.fromisoformat(generated.replace("Z", "+00:00")).date() if generated else None
+    result = PriceListResult(
+        source_file=str(path),
+        supplier_name=(data.get("shop") or {}).get("shop_name"),
+        price_date=price_date,
+    )
+    seen_articles: set[str] = set()
+    for number, product in enumerate(data.get("products") or [], start=1):
+        name = clean_text(product.get("name"))
+        article = _cell_text(product.get("vendor_code")) or _cell_text(product.get("article_code"))
+        if not name:
+            continue
+        # Магазин дублирует свой код в конце названия: «Герметик Tytan, белый [тов-213048]».
+        if article:
+            name = clean_text(name.replace(f"[{article}]", "")) or name
+        price, stock = _city_offer(product.get("cities") or [])
+        if price is None:
+            result.skipped.append((number, "no_price"))
+            continue
+        if not article:
+            result.skipped.append((number, "no_article"))
+            continue
+        if article in seen_articles:
+            result.skipped.append((number, "duplicate_article"))
+            continue
+        seen_articles.add(article)
+
+        brand = clean_text(product.get("brand"))
+        crumbs = [clean_text(c) for c in product.get("breadcrumbs") or []]
+        category = " / ".join(dict.fromkeys(
+            c for c in crumbs if c and c.lower() not in _BREADCRUMB_SKIP and c != brand
+        ))
+        specs = product.get("specifications") or {}
+        details = "; ".join(f"{clean_text(k)}: {clean_text(v)}" for k, v in specs.items() if clean_text(v))
+        pack_size, pack_unit = _pack(name)
+        result.materials.append(ParsedMaterial(
+            article=article,
+            name=name,
+            brand=brand,
+            category=category,
+            # Единиц измерения в каталогах нет: цена магазина — за штуку товара.
+            unit="шт",
+            unit_raw="",
+            price=price,
+            stock=stock,
+            on_sale=False,
+            pack_size=pack_size,
+            pack_unit=pack_unit,
+            source_row=number,
+            details=details[:_DETAILS_LIMIT],
         ))
     return result

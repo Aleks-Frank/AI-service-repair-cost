@@ -8,6 +8,7 @@
     # Прайс-листы поставщиков материалов (база supplier_prices):
     python -m rag.cli validate-prices "data/xlsx/прайс для сервисной компании.xls"
     python -m rag.cli load-prices "data/xlsx/прайс для сервисной компании.xls" --supplier ros_elektro
+    python -m rag.cli load-prices data/shop/shop/sdvor/SdvorPoisk.json --supplier sdvor --name "Строительный двор" --own-articles
     python -m rag.cli search-prices "розетка с заземлением" --top-k 5
     python -m rag.cli list-suppliers
     python -m rag.cli offers CKMP10D-N-040-016-K01 --qty 3       # подбор поставщика для товара
@@ -126,6 +127,7 @@ def cmd_load_prices(args: argparse.Namespace) -> int:
 
     Принимает: args.file — путь к прайсу; args.supplier — код поставщика латиницей;
         args.own_articles — артикулы в прайсе свои, а не производителя;
+        args.name — название поставщика (если в файле его нет или оно служебное);
         args.recreate — пересоздать таблицы (после изменения их структуры).
     Возвращает: код выхода (0 — успех).
     """
@@ -141,6 +143,7 @@ def cmd_load_prices(args: argparse.Namespace) -> int:
         summary = load_price_list(
             session, args.file, args.supplier, build_ml_client(get_settings()),
             article_is_manufacturer=not args.own_articles,
+            supplier_name=args.name,
         )
     print(f"Прайс загружен в supplier_prices.materials, поставщик {args.supplier}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -171,7 +174,7 @@ def cmd_search_prices(args: argparse.Namespace) -> int:
     for position, hit in enumerate(result.hits, start=1):
         item = hit.item
         rerank = f"{hit.rerank_score:.3f}" if hit.rerank_score is not None else "  -  "
-        stock = "нет" if not item.stock else f"{item.stock.normalize():f}"
+        stock = "нет данных" if item.stock is None else f"{item.stock.normalize():f}"
         print(f"{position:>2}. [{item.supplier_code} {item.article}] rerank={rerank} "
               f"dense#{hit.dense_rank or '-'} lex#{hit.lexical_rank or '-'} | {item.name[:70]} | "
               f"{item.price} руб./{item.unit} | остаток {stock}")
@@ -254,7 +257,7 @@ def cmd_offers(args: argparse.Namespace) -> int:
         for offer in sorted(offers, key=lambda o: o.material.base_price):
             m = offer.material
             mark = "→" if offer is best else " "
-            stock = f"{m.stock.normalize():f}" if m.stock else "нет"
+            stock = "нет данных" if m.stock is None else f"{m.stock.normalize():f}"
             score = f" {offer.match_score}" if offer.match_score is not None else ""
             print(f" {mark} {offer.supplier.code:<14} [{m.article}] {m.base_price.normalize():f} руб./{m.base_unit} "
                   f"({m.price} руб./{m.unit}) остаток {stock} | {offer.match_type}{score} | {m.name[:60]}")
@@ -299,6 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("load-prices", help="загрузить прайс поставщика (заменяет только его позиции)")
     p.add_argument("file")
     p.add_argument("--supplier", required=True, help="код поставщика латиницей по названию компании: ros_elektro")
+    p.add_argument("--name", help="название поставщика, например «Строительный двор»")
     p.add_argument("--own-articles", action="store_true",
                    help="артикулы в прайсе — свои коды поставщика, а не производителя")
     p.add_argument("--recreate", action="store_true",
