@@ -57,6 +57,7 @@ def collect_needs(selection: Selection, works: list[dict]) -> list[dict]:
                 "query": material.query,
                 "qty_per_work_unit": str(Decimal(str(material.qty_per_work_unit))),
                 "unit": material.unit,
+                "consumable": material.consumable,
                 "reason": material.reason,
             })
     return needs
@@ -192,6 +193,8 @@ def price_materials(
         buy_qty, amount = purchase(material, need_qty) if need_qty is not None else (None, None)
         if need_qty is None:
             warnings.append("объём работы не определён — количество и сумма не рассчитаны")
+        if need["consumable"]:
+            warnings.append("расход оценён моделью (норм расхода нет) — проверьте количество")
         if material.base_unit != need["unit"]:
             warnings.append(f"единица товара ({material.base_unit}) не совпадает с потребностью ({need['unit']})")
         lines.append({
@@ -200,6 +203,8 @@ def price_materials(
             "work_id": need["work_id"],
             "need": need["query"],
             "need_reason": need["reason"],
+            # Расходник: количество упаковок оценено моделью.
+            "consumable": need["consumable"],
             "choice_reason": reason,
             "name": material.name,
             "article": material.article,

@@ -68,9 +68,26 @@ class MaterialNeed(StrictModel):
     query: str = Field(min_length=3, max_length=200)
     # Сколько материала на одну единицу работы (на 1 шт смены розетки — 1 розетка).
     qty_per_work_unit: float = Field(gt=0, le=1000, allow_inf_nan=False)
-    # Базовая единица материала: штуки или метры.
+    # Базовая единица материала: штуки или метры (для расходников «шт» = мешок, банка, тюбик).
     unit: Literal["шт", "м"]
+    # Расходник (смесь, грунтовка, очиститель): норм расхода нет, количество оценено моделью.
+    consumable: bool = False
     reason: str = Field(default="", max_length=300)
+
+    @model_validator(mode="before")
+    @classmethod
+    def consumable_in_packs(cls, data: object) -> object:
+        """Расходник считается в упаковках: единица всегда «шт».
+
+        Модель иногда пишет единицу работы или вещества («м», «м3», «кг») — такой материал
+        тоже считается расходником, иначе весь ответ этапа 2 был бы отклонён из-за одной единицы.
+
+        Принимает: data — сырой словарь ответа модели.
+        Возвращает: словарь с исправленными unit и consumable.
+        """
+        if isinstance(data, dict) and (data.get("consumable") or data.get("unit") not in ("шт", "м")):
+            data = {**data, "consumable": True, "unit": "шт"}
+        return data
 
 
 class WorkChoice(StrictModel):
@@ -83,7 +100,9 @@ class WorkChoice(StrictModel):
     quantity: float | None = Field(default=None, gt=0, le=1_000_000, allow_inf_nan=False)
     quantity_unit: str = Field(default="", max_length=40)
     # Откуда объём: из описания (нужна цитата), подсчёт предметов на фото или неизвестен.
-    quantity_source: Literal["description", "visible_count", "unknown"] = "unknown"
+    # description — число из текста заявки; visible_count — счёт предметов на фото;
+    # estimate — оценка модели по фото и описанию (в заявках чисел обычно нет); unknown — оценить нельзя.
+    quantity_source: Literal["description", "visible_count", "estimate", "unknown"] = "unknown"
     quantity_evidence: str = Field(default="", max_length=500)
     image_numbers: list[int] = Field(default_factory=list, max_length=4)
     # Основные материалы для работы (норм расхода нет — их предлагает модель).

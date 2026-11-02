@@ -72,7 +72,8 @@ def main(argv: list[str] | None = None) -> int:
     # --- Краткий итог в терминал. ---
     print(f"\n{result['summary']}\n")
     for line in result["works"]:
-        qty = line["quantity"] or "?"
+        # «≈» — объём оценён моделью (в заявке не было чисел), его нужно проверить.
+        qty = (("≈" if line["quantity_source"] == "estimate" else "") + line["quantity"]) if line["quantity"] else "?"
         amount = line["amount_rub"] or "—"
         print(f"  [{line['work_id']:<7}] {line['name'][:70]:<70} {qty:>6} {line['unit']:<5} × {line['unit_price_rub']:>9} = {amount}")
     if result["alternatives"]:
@@ -81,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     if result["materials_priced"]:
         print("\nМатериалы:")
         for line in result["materials"]:
-            need = f"{line['need_qty']} {line['base_unit']}" if line["need_qty"] else "?"
+            # «≈» — расходник: количество упаковок оценено моделью.
+            need = (("≈" if line["consumable"] else "") + f"{line['need_qty']} {line['base_unit']}") if line["need_qty"] else "?"
             buy = f"{line['buy_qty']} {line['price_unit']}" if line["buy_qty"] else "?"
             print(f"  [{line['supplier']:<12}] {line['name'][:58]:<58} нужно {need:>8} купить {buy:>9} "
                   f"× {line['price_rub']:>9} = {line['amount_rub'] or '—'}")
