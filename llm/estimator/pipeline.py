@@ -30,8 +30,8 @@ from llm.estimator.candidates import UNIVERSAL_WORK_ID, add_universal_works, fin
 from llm.estimator.estimate import attach_materials, make_estimate
 from llm.estimator.llm_client import InputTooLong, LLMServiceClient, LLMServiceError
 from llm.estimator.materials import collect_needs, price_materials
-from llm.estimator.prompts import OBSERVATION_PROMPT, SELECTION_PROMPT
-from llm.estimator.schemas import Finding, Observations, Selection
+from llm.estimator.prompts import DEFECT_MATERIALS_PROMPT, OBSERVATION_PROMPT, SELECTION_PROMPT
+from llm.estimator.schemas import DefectMaterials, Finding, Observations, Selection
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,17 @@ def analyze_case(
         Observations, validate_observations, max_new_tokens=observation_max_tokens,
     )
     trace: dict = {"observations": observations.model_dump(), "raw_observations": observation_raw}
+    if not observations.findings and description:
+        # Модель иногда возвращает пустой список дефектов, хотя описание называет неисправность
+        # («не светит лампа»). Тогда вся заявка — один дефект, поиск идёт по её тексту.
+        observations.findings = [Finding(
+            finding_id="f1",
+            object_name="по описанию заявки",
+            visible_issue=description[:700],
+            image_numbers=list(range(1, len(images) + 1)),
+            search_queries=[description[:200]],
+        )]
+        trace.update(findings_from_description=True)
     if not observations.findings:
         empty = Selection(works=[], alternatives=[], unmatched_works=[], assumptions=[])
         trace.update(candidates=[], selection=empty.model_dump(), raw_selection=[])
@@ -141,18 +152,24 @@ def analyze_case(
     trace.update(candidates=candidates, raw_selection=selection_raw, selection_model=selection.model_dump())
     auto_matched = match_unmatched(selection, candidates, retriever)
     trace.update(selection=selection.model_dump(), auto_matched=auto_matched)
-    # Дефектам без единой работы — универсальная «Ремонтные работы» (требование заказчика).
-    universal_notes = add_universal_works(selection, observations, candidates, retriever)
-    trace.update(universal_works=universal_notes)
+    # Дефектам без единой работы — лучший кандидат при высокой оценке поиска, иначе универсальная
+    # «Ремонтные работы» (требование заказчика).
+    added_notes = add_universal_works(selection, observations, candidates, retriever)
+    trace.update(added_works={f"{finding_id} {work_id}": note for (finding_id, work_id), note in added_notes.items()})
     # Сведения об автоматическом сопоставлении остаются только в трассировке, в смету не выводятся.
     result = make_estimate(selection, observations, candidates, description, len(images))
     for line in result["works"]:
-        if line["finding_id"] in universal_notes and line["work_id"] == UNIVERSAL_WORK_ID:
-            line["note"] = universal_notes[line["finding_id"]]
+        if (line["finding_id"], line["work_id"]) in added_notes:
+            line["note"] = added_notes[(line["finding_id"], line["work_id"])]
 
     # --- Этап 4. Материалы для принятых работ и самый дешёвый поставщик. ---
     if material_retriever is not None:
         logger.info("4/4 · Подбор материалов и поставщиков…")
+        # У «Ремонтных работ» нет состава — материалы модель определяет по самому дефекту.
+        trace.update(raw_defect_materials=suggest_defect_materials(
+            selection, observations, {f for f, w in added_notes if w == UNIVERSAL_WORK_ID},
+            description, images, llm, material_selection_max_tokens,
+        ))
         needs = collect_needs(selection, result["works"])
         lines, not_found, material_trace = price_materials(
             needs, description, images, llm, material_retriever, material_candidates, material_selection_max_tokens,
@@ -225,3 +242,51 @@ def select_for_finding(
             choice.image_numbers = [numbers[n - 1] for n in choice.image_numbers if 1 <= n <= len(numbers)]
         return part, raw
     raise LLMServiceError("Дефект слишком объёмный для модели даже с 3 кандидатами. Разделите заявку по участкам.")
+
+
+def suggest_defect_materials(
+    selection: Selection,
+    observations: Observations,
+    finding_ids: set[str],
+    description: str,
+    images: list[bytes],
+    llm: LLMServiceClient,
+    max_new_tokens: int,
+) -> list[str]:
+    """Определяет материалы для «Ремонтных работ» (1-282) по описанию дефекта и его фото.
+
+    У универсальной работы нет состава, поэтому материалы нельзя вывести из работы, как обычно.
+    Для каждого такого дефекта — отдельный короткий вызов модели; найденные потребности
+    записываются в materials работы и дальше подбираются по прайсам как обычные.
+    Ошибка модели по одному дефекту оставляет его без материалов, но не роняет заявку.
+
+    Принимает:
+        selection — выбор работ (изменяется на месте: materials у работ 1-282);
+        observations — дефекты этапа 1;
+        finding_ids — дефекты, которым подставлены «Ремонтные работы»;
+        description — описание заявки;
+        images — все фото заявки;
+        llm — клиент LLM-сервиса;
+        max_new_tokens — лимит длины ответа.
+    Возвращает: сырые ответы модели (для трассировки).
+    """
+    findings = {finding.finding_id: finding for finding in observations.findings}
+    raw_answers: list[str] = []
+    for choice in selection.works:
+        if choice.work_id != UNIVERSAL_WORK_ID or choice.finding_id not in finding_ids:
+            continue
+        finding = findings[choice.finding_id]
+        numbers = [n for n in finding.image_numbers if 1 <= n <= len(images)]
+        payload = {
+            "description": description or None,
+            "defect": {"object": finding.object_name, "issue": finding.visible_issue},
+        }
+        try:
+            answer, raw = llm.ask_json(DEFECT_MATERIALS_PROMPT, payload, [images[n - 1] for n in numbers],
+                                       DefectMaterials, max_new_tokens=max_new_tokens)
+        except (InputTooLong, LLMServiceError) as error:
+            logger.warning("Дефект %s: материалы не определены (%s)", finding.finding_id, error)
+            continue
+        choice.materials = answer.materials
+        raw_answers += raw
+    return raw_answers

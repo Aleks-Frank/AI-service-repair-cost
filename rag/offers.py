@@ -22,7 +22,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from rag.price_list_parser import CRITICAL_PARAMS, model_tokens, models_match, params_match, product_type
+from rag.price_lists.matching import CRITICAL_PARAMS, model_tokens, models_match, params_match, product_type
 from rag.prices_db import Material, Supplier
 from rag.retriever import MaterialRetriever
 

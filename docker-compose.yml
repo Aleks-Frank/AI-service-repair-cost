@@ -51,6 +51,37 @@ services:
       timeout: 5s
       retries: 5
 
+  # Загрузка справочника ПЗР и прайсов в базы по списку data_sources.toml — разовый запуск,
+  # в обычный «docker compose up» не входит (профиль tools). Файлы данных берутся из ./data.
+  #   docker compose run --rm loader            — загрузить только изменившиеся файлы
+  #   docker compose run --rm loader --force    — всё заново;  --prune — удалить поставщиков не из списка
+  loader:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "rag.cli", "load-all", "--data-dir", "/data", "--manifest", "/service/data_sources.toml"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smeta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smeta}
+      POSTGRES_DB: ${POSTGRES_DB:-pzr_pricing}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      PRICES_DB: ${PRICES_DB:-supplier_prices}
+      PRICES_HOST: prices_db
+      PRICES_PORT: 5432
+      ML_SERVICE_URL: http://ml_service:8000
+    volumes:
+      - ./data:/data:ro
+      - ./data_sources.toml:/service/data_sources.toml:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      prices_db:
+        condition: service_healthy
+      ml_service:
+        condition: service_healthy
+
   db:
     # Официальный образ проекта pgvector: обычный Postgres со встроенным расширением vector.
     image: pgvector/pgvector:pg17

@@ -1,0 +1,58 @@
+# Источники данных для баз: справочник ПЗР (pzr-db) и прайсы поставщиков (prices-db).
+# Загрузка всего по этому списку:  python -m rag.cli load-all
+#
+# Пути — относительно папки данных (--data-dir, по умолчанию data/). Сами файлы в git не хранятся:
+# их копируют на сервер отдельно. Этот файл — в git: по нему видно, что должно быть в базах.
+#
+# Поля поставщика:
+#   code         — код латиницей (не менять: по нему поставщик хранится в базе);
+#   name         — название для сметы;
+#   file         — файл прайса;
+#   format       — парсер (rag/price_lists): onec — выгрузка 1С; shop_json — каталог магазина JSON;
+#                  shop_export — выгрузка каталога магазина таблицей (.csv/.xlsx);
+#   own_articles — артикулы — коды магазина, а не производителя (сопоставление только по названию);
+#   options      — параметры парсера, например trust_availability = false: колонка «Наличие»
+#                  заполнена неверно, остаток считается неизвестным.
+# Поставщик, убранный из списка, удаляется из базы командой load-all --prune.
+
+[pzr]
+file = "PZR/ПЗР.xlsx"
+
+[[suppliers]]
+code = "ros_elektro"
+name = "Р.О.С. электро"
+file = "shop/roselectro.xls"
+format = "onec"
+own_articles = false
+
+[[suppliers]]
+code = "sdvor"
+name = "Строительный двор"
+file = "shop/sdvor.csv"
+format = "shop_export"
+own_articles = true
+
+[[suppliers]]
+code = "lemanapro"
+name = "Лемана Про"
+file = "shop/lemano/LemanaproPoisk.json"
+format = "shop_json"
+own_articles = true
+
+[[suppliers]]
+code = "rubilnik"
+name = "Рубильник"
+file = "shop/rubilnik.xlsx"
+format = "shop_export"
+own_articles = true
+# В выгрузке «Наличие» = «Нет» у всех товаров — ошибка выгрузки, остаток неизвестен.
+options = { trust_availability = false }
+
+[[suppliers]]
+code = "santech"
+name = "Сантехкомплект"
+file = "shop/santech.xlsx"
+format = "shop_export"
+own_articles = true
+# В «Артикуле» у магазина полное название товара; код — в «Номенклатурном номере».
+options = { article_column = "Номенклатурный номер" }

@@ -115,20 +115,21 @@ def match_unmatched(selection: Selection, candidates: list[dict], retriever: Hyb
 
 def add_universal_works(
     selection: Selection, observations: Observations, candidates: list[dict], retriever: HybridRetriever,
-) -> dict[str, str]:
+) -> dict[tuple[str, str], str]:
     """Добавляет «Ремонтные работы» (1-282) дефектам, для которых модель не выбрала ни одной работы.
 
     Объём не задаётся — при расчёте подставится минимум 1 чел.-ч. В примечании называются ближайшие
-    найденные позиции ПЗР: работы может не быть в справочнике (тонировочная плёнка), а может быть,
-    что модель не выбрала подходящую (ремонт кладки). Различить эти случаи по оценке поиска нельзя —
-    reranker оценивает похожесть текста, а не пригодность работы, — поэтому решает сметчик.
+    найденные позиции ПЗР (по убыванию оценки поиска): работы может не быть в справочнике, а может
+    быть, что модель не выбрала подходящую. Различить эти случаи по оценке поиска нельзя —
+    reranker оценивает похожесть текста, а не пригодность работы (на прогонах неподходящие позиции
+    получали и 0,99), поэтому решает сметчик.
 
     Принимает:
         selection — выбор модели (изменяется на месте: works дополняется);
         observations — дефекты этапа 1;
         candidates — кандидаты RAG (изменяется на месте: дефекты добавляются в finding_ids 1-282);
         retriever — поиск по ПЗР (нужна сессия базы).
-    Возвращает: {finding_id: примечание} для дефектов, которым добавлена универсальная работа.
+    Возвращает: {(finding_id, work_id): примечание} для добавленных работ.
     """
     allowed = {item["work_id"]: item for item in candidates}
     covered = {
@@ -136,17 +137,17 @@ def add_universal_works(
         if choice.work_id in allowed and choice.finding_id in allowed[choice.work_id]["finding_ids"]
     }
     uncovered = [finding for finding in observations.findings if finding.finding_id not in covered]
+    notes: dict[tuple[str, str], str] = {}
     if not uncovered:
-        return {}
+        return notes
     universal = allowed.get(UNIVERSAL_WORK_ID)
     if universal is None:
         rate = retriever.session.scalar(select(Rate).where(Rate.code == UNIVERSAL_WORK_ID))
         if rate is None:
-            return {}
+            return notes
         universal = _candidate(rate, 0.0)
         candidates.append(universal)
 
-    notes: dict[str, str] = {}
     for finding in uncovered:
         universal["finding_ids"].append(finding.finding_id)
         selection.works.append(WorkChoice(
@@ -158,7 +159,7 @@ def add_universal_works(
                       if finding.finding_id in item["finding_ids"] and item["work_id"] != UNIVERSAL_WORK_ID),
                      key=lambda item: item["retrieval_score"], reverse=True)[:UNIVERSAL_HINTS]
         hints = "; ".join(f"{item['work_id']} {item['name'][:60]}" for item in own)
-        notes[finding.finding_id] = (
+        notes[(finding.finding_id, UNIVERSAL_WORK_ID)] = (
             "Работа не подобрана — подставлены «Ремонтные работы», 1 чел.-ч; уточните состав и объём."
             + (f" Ближайшие позиции ПЗР: {hints}." if hints else "")
         )

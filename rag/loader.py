@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from rag.db import Rate
 from rag.ml_client import MLServiceClient
 from rag.parser import ParsedRate, parse_price_book
-from rag.price_list_parser import ParsedMaterial, extract_params, normalize_article, parse_price_list
+from rag.price_lists import ParsedMaterial, extract_params, normalize_article, parse_price_list
 from rag.prices_db import Material, Supplier
 
 logger = logging.getLogger(__name__)
@@ -85,6 +85,8 @@ def load_price_list(
     models: MLServiceClient,
     article_is_manufacturer: bool = True,
     supplier_name: str | None = None,
+    fmt: str | None = None,
+    parser_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Загружает прайс-лист поставщика в базу supplier_prices.
 
@@ -96,15 +98,17 @@ def load_price_list(
 
     Принимает:
         session — сессия базы прайсов;
-        path — путь к .xls/.xlsx (выгрузка 1С) или .json (каталог магазина);
+        path — путь к прайсу (выгрузка 1С, каталог магазина .json, выгрузка магазина .csv/.xlsx);
         supplier_code — код поставщика по названию компании латиницей («ros_elektro»);
         models — ML-сервис (нужен метод embed);
         article_is_manufacturer — артикулы в прайсе — коды производителя (False — свои коды поставщика);
-        supplier_name — название поставщика; если не задано — из файла (шапка прайса или каталог).
+        supplier_name — название поставщика; если не задано — из файла (шапка прайса или каталог);
+        fmt — формат прайса (ключ rag.price_lists.FORMATS); None — определить по файлу;
+        parser_options — параметры парсера этого формата (например, trust_availability).
     Возвращает: сводку разбора.
     """
     # --- 1. Разбор файла. ---
-    result = parse_price_list(path)
+    result = parse_price_list(path, fmt, **(parser_options or {}))
     summary = result.summary()
     logger.info("Разобрано: %s позиций, %s категорий", summary["materials"], summary["categories"])
 
