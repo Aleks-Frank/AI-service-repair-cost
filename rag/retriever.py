@@ -64,39 +64,12 @@ _MATERIAL_FILTERS = """
     r.supplier_code IN (SELECT code FROM suppliers WHERE active)
     AND (CAST(:suppliers AS text[]) IS NULL OR r.supplier_code = ANY(CAST(:suppliers AS text[])))
     AND (CAST(:units AS text[]) IS NULL OR r.unit = ANY(CAST(:units AS text[])))
-    AND (NOT :in_stock_only OR r.stock > 0)
+    AND (NOT :in_stock_only OR r.stock IS NULL OR r.stock > 0)
 """
 
 
-def _hybrid_sql(table: str, filters: str) -> str:
-    """Собирает SQL гибридного поиска для таблицы с колонками id, embedding и tsv.
-
-    Принимает: table — имя таблицы; filters — условие WHERE (строки таблицы под псевдонимом r).
-    Возвращает: текст SQL-запроса.
-    """
-    # Один SQL-запрос выполняет обе ветки и сливает их через RRF.
-    return f"""
-WITH q AS (
-    SELECT
-        CAST(:query_vector AS vector) AS qvec,
-        -- plainto_tsquery даёт запрос с логическим И («отвал & плитк & подъезд»):
-        -- длинное описание дефекта почти никогда не совпадёт целиком. Меняем И на ИЛИ,
-        -- а ts_rank сам поднимет документы, где совпало больше слов.
-        CAST(replace(CAST(plainto_tsquery('russian', :query_text) AS text), ' & ', ' | ') AS tsquery) AS tsq
-),
-dense_top AS (
-    -- Ветка 1: ближайшие векторы. <=> — косинусное расстояние (0 — полное совпадение).
-    SELECT r.id, r.embedding <=> q.qvec AS distance
-    FROM {table} r, q
-    WHERE {filters}
-    ORDER BY r.embedding <=> q.qvec
-    LIMIT :per_branch
-),
-dense AS (
-    -- Нумеруем отобранные строки: место 1 — самая близкая.
-    SELECT id, 1 - distance AS similarity, row_number() OVER (ORDER BY distance, id) AS rnk
-    FROM dense_top
-),
+# Полнотекстовая ветка одним запросом «слово1 | слово2 | …»: лучшие по ts_rank.
+_LEXICAL_ALL_WORDS = """
 lexical_top AS (
     -- Ветка 2: полнотекстовый поиск. @@ — «документ соответствует запросу».
     SELECT r.id, ts_rank(r.tsv, q.tsq) AS score
@@ -108,7 +81,77 @@ lexical_top AS (
 lexical AS (
     SELECT id, score, row_number() OVER (ORDER BY score DESC, id) AS rnk
     FROM lexical_top
-)
+)"""
+
+# Полнотекстовая ветка по каждому слову отдельно. В прайсах сотни «очистителей», «смесей» и
+# «кабелей»: при общем ранжировании частое слово вытесняет редкое и главное («граффити»,
+# «тонировочная»), и товары с ним не доходят до reranker'а. Здесь у каждого слова свой список
+# лучших совпадений, а место товара — лучшее из его мест в этих списках: первое совпадение по
+# редкому слову стоит рядом с первым по частому. При равных местах выше товар, где совпало
+# больше слов (ts_rank по всему запросу).
+_LEXICAL_PER_WORD = """
+terms AS (
+    -- Слова запроса после стемминга («очиститель граффити» -> очистител, граффит).
+    SELECT t.lexeme, CAST(quote_literal(t.lexeme) AS tsquery) AS tq, count(*) OVER () AS n
+    FROM unnest(tsvector_to_array(to_tsvector('russian', :query_text))) AS t(lexeme)
+),
+lexical_hits AS (
+    SELECT hit.id, hit.term_rank
+    FROM terms, LATERAL (
+        SELECT r.id, row_number() OVER (ORDER BY ts_rank(r.tsv, terms.tq) DESC, r.id) AS term_rank
+        FROM {table} r
+        WHERE {filters} AND r.tsv @@ terms.tq
+        ORDER BY ts_rank(r.tsv, terms.tq) DESC, r.id
+        LIMIT GREATEST(:per_branch / terms.n, 10)
+    ) hit
+),
+lexical_top AS (
+    SELECT h.id, min(h.term_rank) AS best_rank, ts_rank(r.tsv, q.tsq) AS score
+    FROM lexical_hits h JOIN {table} r ON r.id = h.id, q
+    GROUP BY h.id, r.tsv, q.tsq
+),
+lexical AS (
+    SELECT id, score, row_number() OVER (ORDER BY best_rank, score DESC, id) AS rnk
+    FROM lexical_top
+    ORDER BY rnk
+    LIMIT :per_branch
+)"""
+
+
+def _hybrid_sql(table: str, filters: str, lexical_per_word: bool = False) -> str:
+    """Собирает SQL гибридного поиска для таблицы с колонками id, embedding и tsv.
+
+    Принимает: table — имя таблицы; filters — условие WHERE (строки таблицы под псевдонимом r);
+        lexical_per_word — полнотекстовая ветка по каждому слову запроса отдельно (для прайсов).
+    Возвращает: текст SQL-запроса.
+    """
+    lexical_sql = (_LEXICAL_PER_WORD if lexical_per_word else _LEXICAL_ALL_WORDS).format(table=table, filters=filters)
+    # Один SQL-запрос выполняет обе ветки и сливает их через RRF.
+    return f"""
+WITH q AS (
+    SELECT
+        -- plainto_tsquery даёт запрос с логическим И («отвал & плитк & подъезд»):
+        -- длинное описание дефекта почти никогда не совпадёт целиком. Меняем И на ИЛИ,
+        -- а ts_rank сам поднимет документы, где совпало больше слов.
+        CAST(replace(CAST(plainto_tsquery('russian', :query_text) AS text), ' & ', ' | ') AS tsquery) AS tsq
+),
+dense_top AS (
+    -- Ветка 1: ближайшие векторы. <=> — косинусное расстояние (0 — полное совпадение).
+    -- Вектор запроса подставлен прямо в ORDER BY: только так Postgres использует HNSW-индекс.
+    -- Если взять его из CTE (q.qvec), индекс не применяется и сортируется вся таблица
+    -- (на 350 тыс. позиций прайсов — ~1,3 с вместо миллисекунд).
+    SELECT r.id, r.embedding <=> CAST(:query_vector AS vector) AS distance
+    FROM {table} r
+    WHERE {filters}
+    ORDER BY r.embedding <=> CAST(:query_vector AS vector)
+    LIMIT :per_branch
+),
+dense AS (
+    -- Нумеруем отобранные строки: место 1 — самая близкая.
+    SELECT id, 1 - distance AS similarity, row_number() OVER (ORDER BY distance, id) AS rnk
+    FROM dense_top
+),
+{lexical_sql}
 SELECT
     COALESCE(d.id, l.id) AS id,
     d.rnk AS dense_rank,
@@ -130,7 +173,7 @@ LIMIT :limit
 _BRANCH_TOP_ALWAYS = 3
 
 _RATES_SQL = _hybrid_sql("rates", _RATE_FILTERS)
-_MATERIALS_SQL = _hybrid_sql("materials", _MATERIAL_FILTERS)
+_MATERIALS_SQL = _hybrid_sql("materials", _MATERIAL_FILTERS, lexical_per_word=True)
 
 
 def _vector_literal(vector: list[float]) -> str:
@@ -317,7 +360,7 @@ class MaterialRetriever(_HybridSearch):
             use_reranker — переранжировать ли результаты через ML-сервис;
             suppliers — фильтр по кодам поставщиков («ros_elektro»); None — все поставщики;
             units — фильтр по единицам измерения;
-            in_stock_only — только позиции с ненулевым остатком.
+            in_stock_only — без позиций с нулевым остатком (неизвестный остаток допускается).
         Возвращает: SearchResult с позициями по убыванию релевантности (hit.item — Material).
         """
         filters = {"suppliers": suppliers, "units": units, "in_stock_only": in_stock_only}

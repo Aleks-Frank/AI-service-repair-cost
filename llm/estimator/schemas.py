@@ -68,9 +68,37 @@ class MaterialNeed(StrictModel):
     query: str = Field(min_length=3, max_length=200)
     # Сколько материала на одну единицу работы (на 1 шт смены розетки — 1 розетка).
     qty_per_work_unit: float = Field(gt=0, le=1000, allow_inf_nan=False)
-    # Базовая единица материала: штуки или метры.
-    unit: Literal["шт", "м"]
+    # Единица: изделия — штуки или метры; расходники — кг или л (расход вещества), а если
+    # оценить расход нельзя — «шт» (упаковки). Упаковку нужного размера подбирает программа.
+    unit: Literal["шт", "м", "кг", "л"]
+    # Расходник (смесь, грунтовка, очиститель): норм расхода нет, количество оценено моделью.
+    consumable: bool = False
     reason: str = Field(default="", max_length=300)
+
+    @model_validator(mode="before")
+    @classmethod
+    def consumable_units(cls, data: object) -> object:
+        """Приводит единицу расходника к допустимой: кг, л или упаковки («шт»).
+
+        Модель иногда пишет единицу работы («м», «м2», «м3») — такой материал считается расходником
+        в упаковках, иначе весь ответ этапа 2 был бы отклонён из-за одной единицы.
+        «г» и «мл» переводятся в кг и л.
+
+        Принимает: data — сырой словарь ответа модели.
+        Возвращает: словарь с исправленными unit, qty_per_work_unit и consumable.
+        """
+        if not isinstance(data, dict):
+            return data
+        unit = str(data.get("unit") or "").strip().lower().rstrip(".")
+        small = {"г": "кг", "мл": "л"}
+        if unit in small and isinstance(data.get("qty_per_work_unit"), (int, float)):
+            data = {**data, "unit": small[unit], "qty_per_work_unit": data["qty_per_work_unit"] / 1000}
+            unit = small[unit]
+        if unit in ("кг", "л"):
+            return {**data, "unit": unit, "consumable": True}
+        if data.get("consumable") or unit not in ("шт", "м"):
+            return {**data, "consumable": True, "unit": "шт"}
+        return data
 
 
 class WorkChoice(StrictModel):
@@ -83,7 +111,9 @@ class WorkChoice(StrictModel):
     quantity: float | None = Field(default=None, gt=0, le=1_000_000, allow_inf_nan=False)
     quantity_unit: str = Field(default="", max_length=40)
     # Откуда объём: из описания (нужна цитата), подсчёт предметов на фото или неизвестен.
-    quantity_source: Literal["description", "visible_count", "unknown"] = "unknown"
+    # description — число из текста заявки; visible_count — счёт предметов на фото;
+    # estimate — оценка модели по фото и описанию (в заявках чисел обычно нет); unknown — оценить нельзя.
+    quantity_source: Literal["description", "visible_count", "estimate", "unknown"] = "unknown"
     quantity_evidence: str = Field(default="", max_length=500)
     image_numbers: list[int] = Field(default_factory=list, max_length=4)
     # Основные материалы для работы (норм расхода нет — их предлагает модель).
@@ -103,12 +133,19 @@ class Selection(StrictModel):
 
 
 class MaterialChoice(StrictModel):
-    """Выбор товара для одной потребности: артикул из кандидатов или «подходящего нет»."""
+    """Подходящие товары для одной потребности: артикулы из кандидатов или пустой список."""
 
     need_id: str = Field(min_length=1, max_length=20)
-    # Артикул одного из кандидатов этой потребности; null — подходящего товара среди кандидатов нет.
-    article: str | None = Field(default=None, max_length=128)
+    # ВСЕ подходящие по типу и характеристикам кандидаты (в том числе разные фасовки);
+    # самый выгодный по цене и объёму выберет программа. Пустой список — подходящих нет.
+    articles: list[str] = Field(default_factory=list, max_length=10)
     reason: str = Field(default="", max_length=300)
+
+
+class DefectMaterials(StrictModel):
+    """Материалы для устранения дефекта, у которого работа не определена («Ремонтные работы»)."""
+
+    materials: list[MaterialNeed] = Field(default_factory=list, max_length=4)
 
 
 class MaterialSelection(StrictModel):

@@ -1,13 +1,19 @@
 """Командная строка RAG-модуля.
 
 Примеры:
-    python -m rag.cli validate "Справочник ПЗР.xlsx"     # проверить файл, ничего не записывая
-    python -m rag.cli load "Справочник ПЗР.xlsx"         # создать таблицу и загрузить справочник
+    python -m rag.cli validate data/PZR/ПЗР.xlsx     # проверить файл, ничего не записывая
+    python -m rag.cli load data/PZR/ПЗР.xlsx         # создать таблицу и загрузить справочник
     python -m rag.cli search "трещина на стене в подъезде" --top-k 5
 
-    # Прайс-листы поставщиков материалов (база supplier_prices):
-    python -m rag.cli validate-prices "data/xlsx/прайс для сервисной компании.xls"
-    python -m rag.cli load-prices "data/xlsx/прайс для сервисной компании.xls" --supplier ros_elektro
+    # Всё сразу по списку data_sources.toml (загружаются только изменившиеся файлы):
+    python -m rag.cli load-all
+    python -m rag.cli load-all --only sdvor,santech --force
+    python -m rag.cli load-all --prune                          # удалить поставщиков не из списка
+
+    # Прайс-листы поставщиков по одному (база supplier_prices):
+    python -m rag.cli validate-prices data/shop/sdvor.csv
+    python -m rag.cli load-prices data/shop/roselectro.xls --supplier ros_elektro
+    python -m rag.cli load-prices data/shop/sdvor.csv --supplier sdvor --name "Строительный двор" --own-articles
     python -m rag.cli search-prices "розетка с заземлением" --top-k 5
     python -m rag.cli list-suppliers
     python -m rag.cli offers CKMP10D-N-040-016-K01 --qty 3       # подбор поставщика для товара
@@ -106,7 +112,7 @@ def cmd_validate_prices(args: argparse.Namespace) -> int:
     Принимает: args.file — путь к .xls/.xlsx.
     Возвращает: код выхода (0 — успех).
     """
-    from rag.price_list_parser import parse_price_list
+    from rag.price_lists import parse_price_list
 
     result = parse_price_list(args.file)
     print(json.dumps(result.summary(), ensure_ascii=False, indent=2))
@@ -126,6 +132,7 @@ def cmd_load_prices(args: argparse.Namespace) -> int:
 
     Принимает: args.file — путь к прайсу; args.supplier — код поставщика латиницей;
         args.own_articles — артикулы в прайсе свои, а не производителя;
+        args.name — название поставщика (если в файле его нет или оно служебное);
         args.recreate — пересоздать таблицы (после изменения их структуры).
     Возвращает: код выхода (0 — успех).
     """
@@ -141,9 +148,124 @@ def cmd_load_prices(args: argparse.Namespace) -> int:
         summary = load_price_list(
             session, args.file, args.supplier, build_ml_client(get_settings()),
             article_is_manufacturer=not args.own_articles,
+            supplier_name=args.name,
         )
     print(f"Прайс загружен в supplier_prices.materials, поставщик {args.supplier}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _supplier_is_current(session, code: str, path: Path) -> bool:
+    """Проверяет, что прайс поставщика уже загружен из этого файла и файл с тех пор не менялся.
+
+    Принимает: session — сессия базы прайсов; code — код поставщика; path — файл прайса.
+    Возвращает: True — загружать заново не нужно.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import func, select
+
+    from rag.prices_db import Material, Supplier
+
+    supplier = session.get(Supplier, code)
+    if supplier is None or supplier.source_file != path.name or supplier.loaded_at is None:
+        return False
+    has_rows = session.scalar(select(func.count()).select_from(Material).where(Material.supplier_code == code))
+    modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return bool(has_rows) and supplier.loaded_at >= modified
+
+
+def cmd_load_all(args: argparse.Namespace) -> int:
+    """Загружает справочник ПЗР и прайсы всех поставщиков по списку data_sources.toml.
+
+    Прайс, который уже загружен из того же файла и с тех пор не менялся, пропускается — поэтому
+    команду можно запускать после каждого обновления данных: загрузится только новое.
+    Справочник ПЗР загружается, если таблица пуста, или по --force / --only pzr.
+
+    Принимает: args.manifest — путь к data_sources.toml; args.data_dir — папка с файлами;
+        args.only — коды через запятую (pzr и/или коды поставщиков); args.force — загрузить всё
+        заново; args.prune — удалить из базы поставщиков, которых нет в списке.
+    Возвращает: код выхода (0 — успех, 1 — какой-то источник не загрузился).
+    """
+    import tomllib
+
+    from sqlalchemy import func, select
+
+    from rag.db import Rate, get_session_factory, init_db
+    from rag.loader import load_price_book, load_price_list
+    from rag.ml_client import build_ml_client
+    from rag.prices_db import Supplier, get_prices_session_factory, init_prices_db
+
+    manifest = tomllib.loads(Path(args.manifest).read_text(encoding="utf-8"))
+    data_dir = Path(args.data_dir)
+    only = {code.strip() for code in args.only.split(",")} if args.only else None
+    models = build_ml_client(get_settings())
+    failed: list[str] = []
+
+    # --- Справочник ПЗР. ---
+    if "pzr" in manifest and (only is None or "pzr" in only):
+        path = data_dir / manifest["pzr"]["file"]
+        factory = get_session_factory()
+        init_db(factory.kw["bind"])
+        with factory() as session:
+            empty = not session.scalar(select(func.count()).select_from(Rate))
+            if not path.exists():
+                print(f"ПЗР: файл не найден — {path}")
+                failed.append("pzr")
+            elif empty or args.force or only:
+                summary = load_price_book(session, path, models)
+                print(f"ПЗР: загружено {summary['rates']} расценок из {path}")
+            else:
+                print("ПЗР: уже загружен (заново — --force или --only pzr)")
+
+    # --- Прайсы поставщиков. ---
+    factory = get_prices_session_factory()
+    init_prices_db(factory.kw["bind"])
+    listed = manifest.get("suppliers", [])
+    for source in listed:
+        code = source["code"]
+        if only is not None and code not in only:
+            continue
+        path = data_dir / source["file"]
+        if not path.exists():
+            print(f"{code}: файл не найден — {path}")
+            failed.append(code)
+            continue
+        with factory() as session:
+            if not args.force and _supplier_is_current(session, code, path):
+                print(f"{code}: без изменений, пропущен")
+                continue
+            print(f"{code}: загрузка {path} …", flush=True)
+            try:
+                summary = load_price_list(
+                    session, path, code, models,
+                    article_is_manufacturer=not source.get("own_articles", False),
+                    supplier_name=source.get("name"),
+                    fmt=source.get("format"),
+                    parser_options=source.get("options"),
+                )
+            except Exception as error:  # один битый прайс не должен останавливать остальные
+                session.rollback()
+                # Первая строка: у ошибок базы дальше идёт весь SQL-запрос с параметрами.
+                print(f"{code}: ошибка — {str(error).splitlines()[0]}")
+                failed.append(code)
+                continue
+            print(f"{code}: загружено {summary['materials']} позиций, пропущено {sum(summary['skipped'].values())}")
+
+    # --- Поставщики, убранные из списка. ---
+    if args.prune:
+        codes = {source["code"] for source in listed}
+        with factory() as session:
+            for supplier in session.scalars(select(Supplier)).all():
+                if supplier.code not in codes:
+                    # Позиции удаляются каскадно (ondelete="CASCADE" у materials.supplier_code).
+                    session.delete(supplier)
+                    print(f"{supplier.code}: нет в списке — удалён из базы")
+            session.commit()
+
+    if failed:
+        print(f"Не загружены: {', '.join(failed)}")
+        return 1
     return 0
 
 
@@ -171,7 +293,7 @@ def cmd_search_prices(args: argparse.Namespace) -> int:
     for position, hit in enumerate(result.hits, start=1):
         item = hit.item
         rerank = f"{hit.rerank_score:.3f}" if hit.rerank_score is not None else "  -  "
-        stock = "нет" if not item.stock else f"{item.stock.normalize():f}"
+        stock = "нет данных" if item.stock is None else f"{item.stock.normalize():f}"
         print(f"{position:>2}. [{item.supplier_code} {item.article}] rerank={rerank} "
               f"dense#{hit.dense_rank or '-'} lex#{hit.lexical_rank or '-'} | {item.name[:70]} | "
               f"{item.price} руб./{item.unit} | остаток {stock}")
@@ -231,7 +353,7 @@ def cmd_offers(args: argparse.Namespace) -> int:
 
     from rag.ml_client import build_ml_client
     from rag.offers import choose_offer, find_offers, purchase
-    from rag.price_list_parser import normalize_article
+    from rag.price_lists import normalize_article
     from rag.prices_db import Material, get_prices_session_factory
     from rag.retriever import MaterialRetriever
 
@@ -254,7 +376,7 @@ def cmd_offers(args: argparse.Namespace) -> int:
         for offer in sorted(offers, key=lambda o: o.material.base_price):
             m = offer.material
             mark = "→" if offer is best else " "
-            stock = f"{m.stock.normalize():f}" if m.stock else "нет"
+            stock = "нет данных" if m.stock is None else f"{m.stock.normalize():f}"
             score = f" {offer.match_score}" if offer.match_score is not None else ""
             print(f" {mark} {offer.supplier.code:<14} [{m.article}] {m.base_price.normalize():f} руб./{m.base_unit} "
                   f"({m.price} руб./{m.unit}) остаток {stock} | {offer.match_type}{score} | {m.name[:60]}")
@@ -299,11 +421,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("load-prices", help="загрузить прайс поставщика (заменяет только его позиции)")
     p.add_argument("file")
     p.add_argument("--supplier", required=True, help="код поставщика латиницей по названию компании: ros_elektro")
+    p.add_argument("--name", help="название поставщика, например «Строительный двор»")
     p.add_argument("--own-articles", action="store_true",
                    help="артикулы в прайсе — свои коды поставщика, а не производителя")
     p.add_argument("--recreate", action="store_true",
                    help="пересоздать таблицы (после изменения структуры; прайсы остальных удалятся)")
     p.set_defaults(func=cmd_load_prices)
+
+    p = sub.add_parser("load-all", help="загрузить ПЗР и все прайсы по списку data_sources.toml (только изменившиеся)")
+    p.add_argument("--manifest", default="data_sources.toml", help="список источников (по умолчанию data_sources.toml)")
+    p.add_argument("--data-dir", default="data", help="папка с файлами данных (по умолчанию data)")
+    p.add_argument("--only", help="коды через запятую: pzr, sdvor, …")
+    p.add_argument("--force", action="store_true", help="загрузить заново, даже если файлы не менялись")
+    p.add_argument("--prune", action="store_true", help="удалить из базы поставщиков, которых нет в списке")
+    p.set_defaults(func=cmd_load_all)
 
     p = sub.add_parser("search-prices", help="найти материалы в прайсах поставщиков")
     p.add_argument("query")

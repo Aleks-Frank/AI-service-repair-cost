@@ -5,7 +5,8 @@
   * объём подтверждён: цитатой из описания или подсчётом предметов на фото;
   * единица объёма совпадает с единицей расценки;
   * «смена» не дублируется отдельными «демонтажем» и «установкой» того же узла.
-Стоимость = объём × цена из БД. Если объём не подтверждён, сумма остаётся пустой (а не нулевой).
+Стоимость = объём × цена из БД. Если модель объём не указала, подставляется минимум (1 единица
+расценки) с пометкой «проверьте»; если указанный объём не прошёл проверку, сумма остаётся пустой.
 Раздел «Материалы» добавляется функцией attach_materials (строки готовит llm/estimator/materials.py).
 """
 
@@ -19,6 +20,12 @@ from llm.estimator.schemas import Observations, Selection, WorkChoice
 
 # Единицы, которые разрешено «считать по фото» — отдельные различимые предметы.
 COUNTABLE_UNITS = {"шт", "лампа", "прибор", "счетчик", "узел"}
+# Верхняя граница объёма, оценённого моделью (в единицах позиции): большие объёмы по фото
+# без масштаба не оцениваются — их должен задать сметчик.
+ESTIMATE_LIMIT = Decimal(50)
+# Объём по умолчанию, если модель его не указала (1 м², 1 м, 1 шт, 1 чел.-ч): нижняя оценка,
+# чтобы в смете была сумма; сметчик уточняет её.
+MIN_QUANTITY = Decimal(1)
 
 
 def normalized_text(text: str) -> str:
@@ -60,11 +67,17 @@ def checked_quantity(choice: WorkChoice, item: dict, description: str, image_cou
         # Цитата должна дословно встречаться в описании, а число — в цитате.
         # Пунктуацию и кавычки по краям убираем: модель часто цитирует с точкой на конце.
         quote = choice.quantity_evidence.strip().strip(" .,;:!?\"'«»")
-        if not quote or normalized_text(quote) not in normalized_text(description):
-            return None, "Для объёма нет точной цитаты в исходном описании."
         numbers = [Decimal(s.replace(",", ".")) for s in re.findall(r"(?<!\w)\d+(?:[.,]\d+)?", quote)]
-        if quantity not in numbers:
-            return None, "Числовой объём не найден в процитированном описании."
+        if not quote or normalized_text(quote) not in normalized_text(description) or quantity not in numbers:
+            # Цитаты с числом нет — модель на деле оценила объём: проверяем его как оценку
+            # (с пометкой «проверьте» в смете), а не отбрасываем.
+            choice.quantity_source = "estimate"
+    if choice.quantity_source == "estimate":
+        # Оценка модели: принимается с обоснованием и в разумных пределах, в смете помечается.
+        if not choice.quantity_evidence.strip():
+            return None, "Для оценки объёма нет обоснования."
+        if quantity > ESTIMATE_LIMIT:
+            return None, "Оценённый объём слишком велик для оценки по фото; объём задаёт сметчик."
     elif choice.quantity_source == "visible_count":
         # По фото без масштаба можно только посчитать предметы, но не измерить метры.
         if item["unit"] not in COUNTABLE_UNITS:
@@ -133,6 +146,13 @@ def make_estimate(
             quantity, note = checked_quantity(choice, item, description, image_count)
             if quantity is not None and choice.quantity_source == "visible_count":
                 note = "Объём по видимому количеству на фото; фактическое выполнение не подтверждено."
+            elif quantity is not None and choice.quantity_source == "estimate":
+                note = f"Объём оценён по фото и описанию ({choice.quantity_evidence.strip()}) — проверьте."
+            elif choice.quantity is None or choice.quantity_source == "unknown":
+                # Модель объём не указала — подставляем минимум (отклонённый проверкой объём не заменяем).
+                quantity = MIN_QUANTITY
+                choice.quantity_source = "estimate"
+                note = f"Объём не указан — подставлен минимум {MIN_QUANTITY} {item['unit']}, проверьте."
             if item["data_issues"]:
                 warnings.append(f"{item['work_id']}: замечания к данным справочника — {'; '.join(item['data_issues'])}")
             target.append({
