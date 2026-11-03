@@ -26,7 +26,7 @@ class MLServiceClient:
         Возвращает: ничего.
         """
         # Один httpx.Client переиспользует TCP-соединение между запросами — это быстрее.
-        self._http = httpx.Client(base_url=base_url, timeout=timeout_s)
+        self._http = httpx.Client(base_url=base_url, timeout=timeout_s, trust_env=False)
         self._embed_batch = embed_batch
 
     def close(self) -> None:

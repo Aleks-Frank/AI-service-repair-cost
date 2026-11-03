@@ -15,6 +15,7 @@ def main() -> None:
     )
     with target.open("x", encoding="utf-8") as file:
         file.write(template)
+    target.chmod(0o600)
     print("Created .env with local test secrets. Bitrix delivery is disabled.")
 
 
