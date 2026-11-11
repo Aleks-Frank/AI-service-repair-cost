@@ -27,8 +27,12 @@ EMBEDDING_DIM = get_settings().embedding_dim
 TSVECTOR_EXPRESSION = (
     "setweight(to_tsvector('russian', coalesce(name, '')), 'A') || "
     "setweight(to_tsvector('russian', coalesce(work_composition, '')), 'B') || "
-    "setweight(to_tsvector('russian', coalesce(section_title, '')), 'C')"
+    "setweight(to_tsvector('russian', coalesce(section_title, '')), 'C') || "
+    # Синонимы операции («Смена» ↔ «замена») из search_text — с весом наименования (эксперимент B3).
+    "setweight(to_tsvector('russian', coalesce(substring(search_text from 'Синонимы: ([^.]*)[.]'), '')), 'A')"
 )
+# Метка в выражении: по ней init_db понимает, что колонку tsv нужно пересоздать.
+_TSVECTOR_MARKER = "Синонимы"
 
 
 class Base(DeclarativeBase):
@@ -119,3 +123,27 @@ def init_db(engine: Engine) -> None:
         # Расширение vector добавляет тип vector и операторы расстояния (<=> и др.).
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(engine)
+    _migrate_tsvector(engine)
+
+
+def _migrate_tsvector(engine: Engine) -> None:
+    """Пересоздаёт вычисляемую колонку tsv, если её выражение старое (без синонимов операции).
+
+    Выражение вычисляемой колонки в PostgreSQL изменить нельзя — только удалить колонку
+    и добавить заново (значения пересчитываются для всех строк, GIN-индекс создаётся снова).
+
+    Принимает: engine — движок базы ПЗР.
+    Возвращает: ничего.
+    """
+    with engine.begin() as connection:
+        current = connection.execute(text(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d "
+            "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+            "WHERE d.adrelid = 'rates'::regclass AND a.attname = 'tsv'"
+        )).scalar()
+        if current is None or _TSVECTOR_MARKER in current:
+            return
+        connection.execute(text("DROP INDEX IF EXISTS ix_rates_tsv_gin"))
+        connection.execute(text("ALTER TABLE rates DROP COLUMN tsv"))
+        connection.execute(text(f"ALTER TABLE rates ADD COLUMN tsv tsvector GENERATED ALWAYS AS ({TSVECTOR_EXPRESSION}) STORED"))
+        connection.execute(text("CREATE INDEX ix_rates_tsv_gin ON rates USING gin (tsv)"))

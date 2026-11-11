@@ -37,14 +37,23 @@ class LLMServiceClient:
     def close(self) -> None:
         self._http.close()
 
-    def generate(self, system_prompt: str, user_prompt: str, images: list[bytes], max_new_tokens: int) -> str:
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        images: list[bytes],
+        max_new_tokens: int,
+        schema: dict | None = None,
+    ) -> str:
         """Отправляет промпт и фотографии модели и возвращает её текстовый ответ.
 
         Принимает:
             system_prompt — инструкции модели;
             user_prompt — данные заявки;
             images — фотографии (байты JPEG/PNG);
-            max_new_tokens — максимальная длина ответа в токенах.
+            max_new_tokens — максимальная длина ответа в токенах;
+            schema — JSON-схема ответа; локальный сервис её не использует (схема уже в тексте промпта),
+                а API со строгим режимом (GigaChat) — передаёт модели.
         Возвращает: текст ответа модели.
         Исключения: InputTooLong (HTTP 413), LLMServiceError (прочие ошибки).
         """
@@ -96,7 +105,7 @@ class LLMServiceClient:
         prompt = f"ДАННЫЕ ЗАЯВКИ:\n{body}\nJSON_SCHEMA:\n{schema_text}"
         attempts: list[str] = []
         for attempt in range(2):
-            answer = self.generate(system_prompt, prompt, images, max_new_tokens)
+            answer = self.generate(system_prompt, prompt, images, max_new_tokens, schema.model_json_schema())
             attempts.append(answer)
             try:
                 value = schema.model_validate(parse_json_object(answer))
@@ -105,9 +114,12 @@ class LLMServiceClient:
                 return value, attempts
             except (ValueError, TypeError, ValidationError) as error:
                 if attempt == 1:
-                    raise LLMServiceError(
+                    failure = LLMServiceError(
                         f"Модель дважды вернула некорректный ответ. Ошибка проверки: {str(error)[:500]}"
-                    ) from error
+                    )
+                    # Сырые ответы обеих попыток — для трассировки (что именно модель ответила).
+                    failure.attempts = attempts
+                    raise failure from error
                 # Повтор с теми же данными + описание ошибки: модель исправляет формат.
                 prompt = (
                     f"ДАННЫЕ ЗАЯВКИ:\n{body}\nJSON_SCHEMA:\n{schema_text}\n"

@@ -221,8 +221,11 @@ def price_materials(
     for need in needs:
         groups.setdefault(_group_key(need), []).append(need)
     heads = [members[0] for members in groups.values()]
-    candidates = find_material_candidates(retriever, heads, per_need)
+    filtered: dict[str, list[dict]] = {}
+    candidates = find_material_candidates(retriever, heads, per_need, log=filtered)
     trace["material_candidates"] = candidates
+    # Товары другого масштаба (светильник на запрос «лампа»), не показанные модели.
+    trace["material_candidates_filtered"] = filtered
     with_candidates = [head for head in heads if candidates[head["need_id"]]]
 
     # --- 2. Модель отмечает все подходящие товары (цен она не видит). ---
@@ -346,6 +349,8 @@ def price_materials(
             # Расходник: количество оценено моделью.
             "consumable": head["consumable"],
             "name": material.name,
+            # Категория прайса — для проверки совместимости материала с работой (material_validation).
+            "category": material.category or "",
             "article": material.article,
             "supplier": best.supplier.code,
             "supplier_name": best.supplier.name,
