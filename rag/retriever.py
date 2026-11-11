@@ -95,8 +95,21 @@ terms AS (
     SELECT t.lexeme, CAST(quote_literal(t.lexeme) AS tsquery) AS tq, count(*) OVER () AS n
     FROM unnest(tsvector_to_array(to_tsvector('russian', :query_text))) AS t(lexeme)
 ),
+all_words AS (
+    -- Документы, где есть ВСЕ слова запроса («светодиодная лента» — сама лента). Без этой части
+    -- такие документы терялись: по каждому слову отдельно верх занимают товары с одним частым словом
+    -- (по «светодиодн» — лампы, по «лент» — рулетки и стропы), а лента не попадала ни в один список.
+    -- Для длинного запроса совпадение всех слов редкость — тогда работает поиск по отдельным словам.
+    SELECT r.id, row_number() OVER (ORDER BY ts_rank(r.tsv, plainto_tsquery('russian', :query_text)) DESC, r.id) AS term_rank
+    FROM {table} r
+    WHERE {filters} AND r.tsv @@ plainto_tsquery('russian', :query_text)
+    ORDER BY ts_rank(r.tsv, plainto_tsquery('russian', :query_text)) DESC, r.id
+    LIMIT :per_branch
+),
 lexical_hits AS (
-    SELECT hit.id, hit.term_rank
+    SELECT id, term_rank, 0 AS partial FROM all_words
+    UNION ALL
+    SELECT hit.id, hit.term_rank, 1 AS partial
     FROM terms, LATERAL (
         SELECT r.id, row_number() OVER (ORDER BY ts_rank(r.tsv, terms.tq) DESC, r.id) AS term_rank
         FROM {table} r
@@ -106,12 +119,13 @@ lexical_hits AS (
     ) hit
 ),
 lexical_top AS (
-    SELECT h.id, min(h.term_rank) AS best_rank, ts_rank(r.tsv, q.tsq) AS score
+    -- partial = 0 — найдено по всем словам: такие документы идут раньше совпадений по одному слову.
+    SELECT h.id, min(h.partial) AS partial, min(h.term_rank) AS best_rank, ts_rank(r.tsv, q.tsq) AS score
     FROM lexical_hits h JOIN {table} r ON r.id = h.id, q
     GROUP BY h.id, r.tsv, q.tsq
 ),
 lexical AS (
-    SELECT id, score, row_number() OVER (ORDER BY best_rank, score DESC, id) AS rnk
+    SELECT id, score, row_number() OVER (ORDER BY partial, best_rank, score DESC, id) AS rnk
     FROM lexical_top
     ORDER BY rnk
     LIMIT :per_branch

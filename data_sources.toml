@@ -56,3 +56,20 @@ format = "shop_export"
 own_articles = true
 # В «Артикуле» у магазина полное название товара; код — в «Номенклатурном номере».
 options = { article_column = "Номенклатурный номер" }
+
+[[suppliers]]
+code = "kuvalda"
+name = "Кувалда"
+file = "shop/kuvalda.xlsx"
+format = "shop_export"
+own_articles = true
+# Колонки остатка нет; «Наличие» = «Да» почти у всех — остаток считается неизвестным (в наличии).
+
+[[suppliers]]
+code = "svetodiod66"
+name = "Светодиод66"
+file = "shop/svetodiod66.xlsx"
+format = "shop_export"
+own_articles = true
+# Освещение: светильники (в т. ч. уличные консольные ДКУ), LED-ленты, блоки питания, лампы.
+# Единица цены — из «Цена указана» («за 1 метр» у лент); «Наличие» заполнено (Да/Нет) и учитывается.

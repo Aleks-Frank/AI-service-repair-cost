@@ -15,4 +15,4 @@ dependencies = {file = ["requirements.txt"]}
 include = ["rag*", "llm.estimator*"]
 
 [tool.pytest.ini_options]
-testpaths = ["backend/tests"]
+testpaths = ["backend/tests", "llm/tests", "rag/tests"]
