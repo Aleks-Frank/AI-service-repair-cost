@@ -17,6 +17,8 @@
     python -m rag.cli search-prices "розетка с заземлением" --top-k 5
     python -m rag.cli list-suppliers
     python -m rag.cli offers CKMP10D-N-040-016-K01 --qty 3       # подбор поставщика для товара
+    python -m rag.cli train-classifier "Задачи_для проекта (05-10.2026).xlsx"   # тип обращения по тексту
+    python -m rag.cli classify "Не горит лампа в подъезде"
 """
 
 import argparse
@@ -340,6 +342,33 @@ def cmd_delete_prices(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train_classifier(args: argparse.Namespace) -> int:
+    """Обучает классификатор типа обращения на выгрузке задач Битрикс24.
+
+    Принимает: args — export (путь к .xlsx), model (куда сохранить).
+    Возвращает: код выхода (0 — успех).
+    """
+    from rag.request_classifier import train
+
+    summary = train(args.export, args.model)
+    print(json.dumps(summary, ensure_ascii=False))
+    print(f"Модель сохранена: {args.model}")
+    return 0
+
+
+def cmd_classify(args: argparse.Namespace) -> int:
+    """Показывает вероятные типы обращения для текста заявки.
+
+    Принимает: args — text (текст заявки), model (файл модели).
+    Возвращает: код выхода (0 — успех).
+    """
+    from rag.request_classifier import RequestClassifier
+
+    types = RequestClassifier.load(args.model).likely_types(args.text)
+    print("Тип:", ", ".join(f"{t} ({p:.0%})" for t, p in types))
+    return 0
+
+
 def cmd_offers(args: argparse.Namespace) -> int:
     """Показывает предложения одного товара у всех поставщиков и выбор самого дешёвого.
 
@@ -456,6 +485,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--supplier", help="поставщик эталона (если артикул есть у нескольких)")
     p.add_argument("--qty", type=float, help="потребность в базовых единицах (шт, м)")
     p.set_defaults(func=cmd_offers)
+
+    default_model = Path("data/models/request_types.pkl")
+    p = sub.add_parser("train-classifier", help="обучить классификатор типа обращения на выгрузке задач Битрикс24")
+    p.add_argument("export", type=Path, help=".xlsx с колонками «Описание» и «Тип обращения»")
+    p.add_argument("--model", type=Path, default=default_model, help="куда сохранить модель")
+    p.set_defaults(func=cmd_train_classifier)
+
+    p = sub.add_parser("classify", help="тип обращения для текста заявки")
+    p.add_argument("text", help="текст заявки")
+    p.add_argument("--model", type=Path, default=default_model, help="файл модели")
+    p.set_defaults(func=cmd_classify)
     return parser
 
 

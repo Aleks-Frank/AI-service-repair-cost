@@ -32,6 +32,18 @@ class Finding(StrictModel):
     image_numbers: list[int] = Field(max_length=4)
     # Короткие запросы «объект + работа» для поиска в справочнике («смена розетки»).
     search_queries: list[str] = Field(min_length=1, max_length=3)
+    # --- Структура ремонта (необязательные поля: старые трассировки без них читаются). ---
+    # Что нужно сделать («замена лампы», «замена светильника целиком», «ремонт короба»).
+    operation: str = Field(default="", max_length=200)
+    # confirmed — операция прямо названа в заявке или осмотре; inferred — выведена, но вариант
+    # один и очевиден; unknown — возможны разные операции (лампа или светильник целиком, проводка…).
+    operation_status: Literal["confirmed", "inferred", "unknown"] = "inferred"
+    # При unknown — возможные варианты операции (ни один не считается установленным).
+    possible_operations: list[str] = Field(default_factory=list, max_length=4)
+    # Где объект: в помещении, снаружи или неизвестно.
+    environment: Literal["indoor", "outdoor", "unknown"] = "unknown"
+    # Что уточнить при осмотре (тип изделия, количество, высота и способ доступа…).
+    questions: list[str] = Field(default_factory=list, max_length=4)
 
 
 class Observations(StrictModel):
@@ -113,9 +125,16 @@ class WorkChoice(StrictModel):
     # Откуда объём: из описания (нужна цитата), подсчёт предметов на фото или неизвестен.
     # description — число из текста заявки; visible_count — счёт предметов на фото;
     # estimate — оценка модели по фото и описанию (в заявках чисел обычно нет); unknown — оценить нельзя.
-    quantity_source: Literal["description", "visible_count", "estimate", "unknown"] = "unknown"
+    # inspection — число из записи осмотра мастера (нужна цитата из неё).
+    quantity_source: Literal["inspection", "description", "visible_count", "estimate", "unknown"] = "unknown"
     quantity_evidence: str = Field(default="", max_length=500)
     image_numbers: list[int] = Field(default_factory=list, max_length=4)
+    # Совместимость позиции с дефектом по осям (самооценка модели; «no» по любой оси — позиция
+    # отклоняется кодом). Значения по умолчанию — для старых ответов без этих полей.
+    object_match: Literal["yes", "no", "unclear"] = "unclear"
+    operation_match: Literal["yes", "no", "unclear"] = "unclear"
+    scale_match: Literal["yes", "no", "unclear"] = "unclear"
+    environment_match: Literal["yes", "no", "unclear"] = "unclear"
     # Основные материалы для работы (норм расхода нет — их предлагает модель).
     materials: list[MaterialNeed] = Field(default_factory=list, max_length=5)
 

@@ -5,8 +5,12 @@
   * объём подтверждён: цитатой из описания или подсчётом предметов на фото;
   * единица объёма совпадает с единицей расценки;
   * «смена» не дублируется отдельными «демонтажем» и «установкой» того же узла.
-Стоимость = объём × цена из БД. Если модель объём не указала, подставляется минимум (1 единица
-расценки) с пометкой «проверьте»; если указанный объём не прошёл проверку, сумма остаётся пустой.
+Стоимость = объём × цена из БД. Количество штучных изделий (лампы, светильники, краны) берётся из
+осмотра мастера, числа при самом изделии в описании или подсчёта на фото; иначе — минимум 1 шт
+(плановая калькуляция нужна с суммой; число при другом предмете, «2-х столбах», не принимается).
+Для непрерывных объёмов (м², м, чел.-ч) допускается оценка с пометкой «проверьте»; если модель объём
+не указала — минимум (1 единица расценки) с пометкой. Если указанный объём не прошёл проверку
+(неверная единица, слишком большая оценка), сумма остаётся пустой.
 Раздел «Материалы» добавляется функцией attach_materials (строки готовит llm/estimator/materials.py).
 """
 
@@ -16,6 +20,7 @@ import re
 from decimal import ROUND_HALF_UP, Decimal
 
 from rag.normalizers import normalize_unit
+from llm.estimator.compatibility import number_counts_object
 from llm.estimator.schemas import Observations, Selection, WorkChoice
 
 # Единицы, которые разрешено «считать по фото» — отдельные различимые предметы.
@@ -46,14 +51,21 @@ def money(value: Decimal | str) -> str:
     return str(Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def checked_quantity(choice: WorkChoice, item: dict, description: str, image_count: int) -> tuple[Decimal | None, str | None]:
+# Статус подтверждения объёма по источнику (поле quantity_status строки сметы).
+QUANTITY_STATUS = {"inspection": "confirmed", "description": "confirmed", "visible_count": "counted",
+                   "estimate": "estimate"}
+
+
+def checked_quantity(choice: WorkChoice, item: dict, description: str, image_count: int,
+                     inspection: str = "") -> tuple[Decimal | None, str | None]:
     """Проверяет объём, предложенный моделью; неподтверждённый объём не принимается.
 
     Принимает:
         choice — выбор модели (объём, единица, источник, цитата);
-        item — кандидат-расценка (нужна единица измерения);
+        item — кандидат-расценка (нужны единица измерения и наименование);
         description — исходное описание заявки;
-        image_count — сколько фото в заявке.
+        image_count — сколько фото в заявке;
+        inspection — текст осмотра мастера ("" — осмотра нет).
     Возвращает: кортеж (объём или None, пояснение, почему объём не принят, или None).
     """
     if choice.quantity is None or choice.quantity_source == "unknown":
@@ -63,15 +75,23 @@ def checked_quantity(choice: WorkChoice, item: dict, description: str, image_cou
     if normalize_unit(choice.quantity_unit) != item["unit"]:
         return None, "Единица объёма не совпадает со справочником; пересчёт не выполнен."
 
-    if choice.quantity_source == "description":
-        # Цитата должна дословно встречаться в описании, а число — в цитате.
+    if choice.quantity_source in ("description", "inspection"):
+        # Цитата должна дословно встречаться в описании (или в осмотре), а число — в цитате и
+        # относиться к объекту работы («2-х столбах» — не количество ламп).
         # Пунктуацию и кавычки по краям убираем: модель часто цитирует с точкой на конце.
+        source_text = inspection if choice.quantity_source == "inspection" else description
         quote = choice.quantity_evidence.strip().strip(" .,;:!?\"'«»")
         numbers = [Decimal(s.replace(",", ".")) for s in re.findall(r"(?<!\w)\d+(?:[.,]\d+)?", quote)]
-        if not quote or normalized_text(quote) not in normalized_text(description) or quantity not in numbers:
-            # Цитаты с числом нет — модель на деле оценила объём: проверяем его как оценку
-            # (с пометкой «проверьте» в смете), а не отбрасываем.
+        if (not quote or normalized_text(quote) not in normalized_text(source_text) or quantity not in numbers
+                or not number_counts_object(quote, float(quantity), item["name"])):
+            # Цитаты с числом объекта нет — модель на деле оценила объём: проверяем его как оценку.
             choice.quantity_source = "estimate"
+    if choice.quantity_source == "estimate" and item["unit"] in COUNTABLE_UNITS:
+        # Штучные изделия «на глаз» не оцениваются: без числа в заявке или подсчёта на фото количество
+        # считается неуказанным — make_estimate подставит минимум 1 шт, а не догадку модели
+        # (например, по числу столбов или этажей).
+        choice.quantity_source = "unknown"
+        return None, "Количество изделий не указано."
     if choice.quantity_source == "estimate":
         # Оценка модели: принимается с обоснованием и в разумных пределах, в смете помечается.
         if not choice.quantity_evidence.strip():
@@ -109,7 +129,8 @@ def _action(name: str) -> str:
 
 
 def make_estimate(
-    selection: Selection, observations: Observations, candidates: list[dict], description: str, image_count: int
+    selection: Selection, observations: Observations, candidates: list[dict], description: str, image_count: int,
+    inspection: str = "",
 ) -> dict:
     """Проверяет выбор модели и собирает черновик сметы.
 
@@ -117,7 +138,8 @@ def make_estimate(
         selection — выбор работ моделью (этап 2);
         observations — найденные дефекты (этап 1);
         candidates — кандидаты из RAG (только из них можно выбирать);
-        description — описание заявки; image_count — число фото.
+        description — описание заявки; image_count — число фото;
+        inspection — текст осмотра мастера ("" — осмотра нет).
     Возвращает: словарь сметы: основные работы, альтернативы, суммы, предупреждения.
     """
     allowed = {item["work_id"]: item for item in candidates}
@@ -143,7 +165,7 @@ def make_estimate(
                 continue
             seen.add(key)
 
-            quantity, note = checked_quantity(choice, item, description, image_count)
+            quantity, note = checked_quantity(choice, item, description, image_count, inspection)
             if quantity is not None and choice.quantity_source == "visible_count":
                 note = "Объём по видимому количеству на фото; фактическое выполнение не подтверждено."
             elif quantity is not None and choice.quantity_source == "estimate":
@@ -162,6 +184,10 @@ def make_estimate(
                 "reason": choice.reason,
                 "quantity": str(quantity) if quantity is not None else None,
                 "quantity_source": choice.quantity_source if quantity is not None else "unknown",
+                # confirmed (осмотр/описание), counted (фото), estimate (оценка или минимум) или
+                # needs_confirmation (объём не принят проверкой).
+                "quantity_status": QUANTITY_STATUS.get(choice.quantity_source, "needs_confirmation")
+                if quantity is not None else "needs_confirmation",
                 "quantity_evidence": choice.quantity_evidence,
                 "image_numbers": choice.image_numbers,
                 # Стоимость = объём × цена из БД; цена от модели никогда не берётся.
@@ -320,4 +346,15 @@ def estimate_csv(result: dict) -> str:
                                                "", "", "", "", "", item["reason"])])
         writer.writerow(["Материалы итого, руб.", result["materials_total_rub"] or "Не рассчитано"])
         writer.writerow(["Всего (работы + материалы), руб.", result["total_rub"] or "Не рассчитано"])
+    # Техника — необязательный блок (в старых сметах его нет); стоимость — только по тарифу владельца.
+    if result.get("equipment_requirements"):
+        writer.writerow([])
+        writer.writerow(["Техника", "Работа", "Наименование", "Назначение", "Основание", "Стоимость", "Проверить"])
+        for item in result["equipment_requirements"]:
+            writer.writerow([safe(v) for v in ("", item["work_id"], f"{item['name']} — {item['technical_name']}",
+                                               item["purpose"], item["evidence"],
+                                               "в расценке" if item["pricing_status"] == "included_in_rate"
+                                               else (f"{item['amount_rub']} руб. ({item['quantity']} {item['unit']})"
+                                                     if item.get("amount_rub") else "не рассчитана"),
+                                               "да" if item["needs_human_confirmation"] else "нет")])
     return "﻿" + output.getvalue()
