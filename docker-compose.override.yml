@@ -1,0 +1,12 @@
+services:
+  llm_service:
+    environment:
+      LD_LIBRARY_PATH: /opt/nvidia-570/lib
+    volumes:
+      - /opt/nvidia-570/lib:/opt/nvidia-570/lib:ro
+
+  ml_service:
+    environment:
+      LD_LIBRARY_PATH: /opt/nvidia-570/lib
+    volumes:
+      - /opt/nvidia-570/lib:/opt/nvidia-570/lib:ro

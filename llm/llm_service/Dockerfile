@@ -14,7 +14,9 @@ WORKDIR /srv
 
 # torch с индекса PyTorch (из кэша сборки) + torchvision той же сборки: он нужен процессору Qwen3-VL.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
-RUN --mount=type=cache,target=/root/.cache/pip pip install torch torchvision --index-url ${TORCH_INDEX}
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.10.0 torchvision==0.25.0 \
+    --index-url ${TORCH_INDEX}
 
 COPY llm_service/requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt

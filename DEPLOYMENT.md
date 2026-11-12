@@ -22,6 +22,29 @@ docker version
 docker compose version
 nvidia-smi
 docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+
+sudo docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+sudo usermod -aG docker $USER
+newgrp docker
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+nvidia-ctk --version
+
+
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor --yes \
+    -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt-get update
+
+sudo apt-get install -s nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
 ```
 
 Если GPU не видна из последней команды, сначала настройте NVIDIA Container Toolkit.
@@ -98,6 +121,21 @@ docker compose build
 docker compose up -d db prices_db ml_service llm_service
 docker compose up -d tunnel
 docker compose logs -f ml_service llm_service
+```
+ 
+
+```bash
+ОТ СТЕПАНА
+в .env
+DEVICE=cuda                         # эмбеддинги и reranker на GPU (локально у нас было cpu)
+LLM_MODEL=Qwen/Qwen3-VL-8B-Instruct # обязательно: по умолчанию в compose стоит 4B
+RERANK_TOP_N=10
+SELECTION_MAX_TOKENS=3000
+
+docker compose up -d --build          # все сервисы сразу
+docker compose ps                     # все healthy (llm_service ~1–2 мин)
+docker compose run --rm loader        # ПЗР и прайсы — на GPU минуты, а не часы
+docker compose run --rm --entrypoint python loader -m rag.cli list-suppliers
 ```
 
 Дождитесь загрузки моделей. Выход из просмотра логов — `Ctrl+C`, контейнеры

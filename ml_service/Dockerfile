@@ -12,7 +12,9 @@ WORKDIR /srv
 # а отдельный слой не пересобирается при изменении остальных зависимостей.
 # Для сервера без GPU замените cu130 на cpu.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
-RUN --mount=type=cache,target=/root/.cache/pip pip install torch --index-url ${TORCH_INDEX}
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==2.10.0 \
+    --index-url ${TORCH_INDEX}
 
 COPY ml_service/requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
