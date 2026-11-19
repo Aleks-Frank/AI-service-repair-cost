@@ -22,6 +22,7 @@
 import io
 import logging
 import math
+import re
 from decimal import Decimal
 
 from PIL import Image, ImageOps
@@ -36,6 +37,7 @@ from llm.estimator.estimate import attach_materials, make_estimate
 from llm.estimator.llm_client import InputTooLong, LLMServiceClient, LLMServiceError
 from llm.estimator.materials import collect_needs, price_materials
 from llm.estimator.lamp_defaults import apply_linear_lamp_default
+from llm.estimator.material_checklist import add_checklist_needs
 from llm.estimator.material_validation import attach_validation, validate_lines
 from llm.estimator.prompts import DEFECT_MATERIALS_PROMPT, OBSERVATION_PROMPT, SELECTION_PROMPT
 from llm.estimator.schemas import DefectMaterials, Finding, Observations, Selection
@@ -339,6 +341,8 @@ def analyze_case(
         trace["rejected_materials"] = drop_conflicting_materials(
             selection, observations, names, result["warnings"])
         needs = collect_needs(selection, result["works"])
+        # Чек-лист (EXP-C6): обязательные материалы по виду работы, если модель их не запросила.
+        trace["checklist_needs"] = add_checklist_needs(needs, result["works"])
         lines, not_found, material_trace = price_materials(
             needs, description, images, llm, material_retriever, material_candidates, material_selection_max_tokens,
         )
@@ -394,6 +398,34 @@ def drop_conflicting_materials(selection: Selection, observations: Observations,
                 kept.append(material)
         choice.materials = kept
     return dropped
+
+
+def description_for_finding(description: str, finding: Finding, findings_count: int) -> str:
+    """Фрагмент текста заявки, который относится к одному дефекту (EXP-C1, a07).
+
+    Выбор работ идёт отдельно по каждому дефекту, но раньше в каждый вызов шёл весь текст заявки:
+    при выборе работы для лампы модель читала и про заглушку на другом этаже и отвечала сразу про оба
+    дефекта. Если дефектов несколько, текст делится на фразы и остаются те, где больше всего общих
+    основ слов с объектом, проблемой и запросами дефекта. С одним дефектом текст не меняется.
+
+    Принимает: description — текст заявки; finding — дефект этапа 1; findings_count — дефектов в заявке.
+    Возвращает: фрагмент текста или весь текст, если разделить нельзя (одна фраза, нет совпадений).
+    """
+    if findings_count < 2 or not description:
+        return description
+    parts = [p.strip() for p in re.split(r"(?<=[.!?;])\s+(?=[А-ЯЁA-Z0-9])|\n+", description) if p.strip()]
+    if len(parts) < 2:
+        return description
+
+    def stems(text: str) -> set[str]:
+        return {word[:5] for word in re.findall(r"[а-яё]{4,}", text.lower().replace("ё", "е"))}
+
+    own = stems(" ".join([finding.object_name, finding.visible_issue, *finding.search_queries]))
+    scores = [len(stems(part) & own) for part in parts]
+    best = max(scores)
+    if best == 0:
+        return description
+    return " ".join(part for part, score in zip(parts, scores) if score == best)
 
 
 def _selection_validator(finding_id: str, allowed: set[str]):
@@ -474,7 +506,8 @@ def select_for_finding(
         # finding_ids — только этот дефект, чтобы модель не привязывала работу к чужому.
         prompt_candidates = [{**{k: c[k] for k in ("work_id", "name", "composition", "unit")},
                               "finding_ids": [finding.finding_id]} for c in own[:limit]]
-        payload = {"description": description or None, "inspection": inspection or None,
+        own_text = description_for_finding(description, finding, len(observations.findings))
+        payload = {"description": own_text or None, "inspection": inspection or None,
                    "observations": local_observations, "CANDIDATES": prompt_candidates}
         validator = _selection_validator(finding.finding_id, {c["work_id"] for c in prompt_candidates})
         state = {"prompt_candidates": [{k: c[k] for k in ("work_id", "name")} for c in prompt_candidates]}

@@ -281,7 +281,10 @@ def test_mixed_request_fallback_only_for_one_finding():
     assert len(defect_prompts) == 1 and '"object":"лампа"' in defect_prompts[0]
     # Потребность из выбора работ для f2 не продублирована и привязана к своей работе.
     missing = result["materials_not_found"]
-    assert [(item["query"], item["work_id"]) for item in missing] == [("кран водоразборный", "2-14")]
+    # Паста и лён к смене крана добавляет чек-лист (EXP-C6) — здесь проверяется только потребность модели.
+    checklist = {"паста уплотнительная сантехническая", "лён сантехнический"}
+    assert [(item["query"], item["work_id"]) for item in missing if item["query"] not in checklist] == [
+        ("кран водоразборный", "2-14")]
 
 
 def test_alternative_is_not_in_total():
@@ -313,3 +316,22 @@ def test_refusal_is_not_overridden_by_similar_candidate():
     result, _ = run(llm, FakeRetriever(LAMP))
     assert [line["work_id"] for line in result["works"]] == [UNIVERSAL_WORK_ID]
     assert result["works"][0]["fallback_reason"] == "model_unmatched"
+
+
+def test_description_split_per_finding():
+    """EXP-C1, a07: при нескольких дефектах модель видит только фразу своего дефекта; с одним — весь текст."""
+    from llm.estimator.pipeline import description_for_finding
+    from llm.estimator.schemas import Finding
+
+    text = "24 этаж - требуется заглушка (см. фото). 5 этаж не работает лампа в лифтовом холле"
+    lamp = Finding(finding_id="f2", object_name="лампа в лифтовом холле", visible_issue="лампа не работает",
+                   image_numbers=[], search_queries=["замена лампы"])
+    plug = Finding(finding_id="f1", object_name="заглушка", visible_issue="отсутствует заглушка",
+                   image_numbers=[], search_queries=["установка заглушки"])
+    assert description_for_finding(text, lamp, 2) == "5 этаж не работает лампа в лифтовом холле"
+    assert description_for_finding(text, plug, 2) == "24 этаж - требуется заглушка (см. фото)."
+    assert description_for_finding(text, lamp, 1) == text
+    # Нет общих слов — текст не режется.
+    other = Finding(finding_id="f3", object_name="дверь", visible_issue="скрипит", image_numbers=[],
+                    search_queries=["ремонт двери"])
+    assert description_for_finding(text, other, 2) == text

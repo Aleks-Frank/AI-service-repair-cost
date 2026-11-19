@@ -19,6 +19,8 @@ from llm.estimator.schemas import Observations, Selection, WorkChoice
 # Универсальная расценка «Ремонтные работы» (чел.-ч): по указанию заказчика ставится, если для дефекта
 # в ПЗР нет подходящей работы.
 UNIVERSAL_WORK_ID = "1-282"
+# Сколько расценок брать с каждого запроса в общий пул дефекта (до общего переранжирования).
+POOL_PER_QUERY = 15
 # Сколько ближайших позиций ПЗР назвать сметчику в примечании к «Ремонтным работам».
 UNIVERSAL_HINTS = 3
 
@@ -98,8 +100,9 @@ def find_candidates(
 ) -> list[dict]:
     """Подбирает расценки-кандидаты для каждого дефекта через RAG-модуль.
 
-    Для каждого дефекта ищем по нескольким веткам запросов, для каждой расценки запоминаем
-    лучшую оценку reranker'а и оставляем per_finding лучших. Ветки:
+    Для каждого дефекта ищем по нескольким веткам запросов и собираем общий пул расценок;
+    reranker один раз оценивает пул относительно общего запроса (текст заявки + объект и проблема),
+    остаются per_finding лучших. Ветки:
         finding_query — поисковые запросы модели из этапа 1 (search_queries);
         object_issue — связка «объект + проблема» из этапа 1;
         description — исходный текст заявки без шаблонных фраз (если передан description);
@@ -120,9 +123,16 @@ def find_candidates(
     Возвращает: список кандидатов-словарей (без повторов, с finding_ids).
     """
     shared = []
-    if (query := description_query(description)) is not None:
-        shared.append(("description", query))
+    raw_text = description_query(description)
+    if raw_text is not None:
+        shared.append(("description", raw_text))
     shared += [("dictionary", query) for query in extra_queries or []]
+    # Общий пул (EXP-C1): оценки reranker разных запросов между собой не сравнимы — расценка,
+    # найденная по тексту жильца, проигрывала найденным по запросам модели и не доходила до модели.
+    # Поэтому пул собирается по RRF без reranker, а reranker один раз оценивает весь пул относительно
+    # общего запроса «текст заявки + объект и проблема». На 10 АВР: 3 → 6 из 11 работ мастера в кандидатах.
+    # Поиск без rerank_texts (заглушки в тестах) работает по-старому: max оценки по запросам.
+    pooled = hasattr(retriever, "rerank_texts")
     merged: dict[str, dict] = {}
     for finding in observations.findings:
         best: dict[str, tuple[float, Rate]] = {}
@@ -130,13 +140,24 @@ def find_candidates(
         queries = [*(("finding_query", q) for q in finding.search_queries),
                    ("object_issue", f"{finding.object_name} {finding.visible_issue}"), *shared]
         for branch, query in queries:
-            for rank, hit in enumerate(retriever.search(query, top_k=per_finding).hits, start=1):
+            if pooled:
+                hits = retriever.search(query, top_k=max(per_finding, POOL_PER_QUERY), use_reranker=False).hits
+            else:
+                hits = retriever.search(query, top_k=per_finding).hits
+            for rank, hit in enumerate(hits, start=1):
                 # Основная оценка — reranker; если он не применялся, берём балл RRF.
                 score = hit.rerank_score if hit.rerank_score is not None else hit.rrf_score
                 code = hit.item.code
                 found_by.setdefault(code, []).append({"branch": branch, "rank": rank, "score": round(score, 4)})
                 if code not in best or score > best[code][0]:
                     best[code] = (score, hit.item)
+        if pooled and best:
+            common = f"{finding.object_name}: {finding.visible_issue}"
+            if raw_text:
+                common = f"{raw_text}. {common}"
+            rates = [rate for _, rate in best.values()]
+            scores = retriever.rerank_texts(common, [rate.search_text for rate in rates])
+            best = {rate.code: (float(score), rate) for score, rate in zip(scores, rates)}
         ranked = sorted(best.values(), key=lambda pair: pair[0], reverse=True)
         if log is not None:
             log[finding.finding_id] = {
