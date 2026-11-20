@@ -16,14 +16,22 @@ report — метрики по компонентам (раздел 3 регла
     материалы: точность, полнота и F1 (материал плана засчитывается по шаблону match эталона);
     техника: найдена ли там, где она была у мастера (стоимость техники не рассчитывается);
     суммы: WAPE, смещение (signed bias), доля заявок в ±10 % и ±20 % — по полной сумме, по работам
-    и по полной сумме без техники (тарифа нет, поэтому её стоимость в план не попадает).
+    и по полной сумме без техники (тарифа нет, поэтому её стоимость в план не попадает);
+    по замечаниям защиты 3 спринта: воронка по шагам (работы: в кандидатах → выбрано; материалы:
+    запрошено → найдено в прайсах → в смете), недостача материалов в рублях, средняя ошибка суммы
+    в рублях, медиана и 90-й перцентиль ошибки в %.
 Пишет metrics.json, per_request.json и report.md (при --baseline — сравнение и изменения по заявкам).
+
+    python -m llm.estimator.avr_eval compare <прогон1> <прогон2> …
+печатает таблицу метрик нескольких прогонов по текущему эталону, в папки прогонов ничего не пишет.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import re
+import statistics
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +53,19 @@ def _git(*args: str) -> str:
         return ""
 
 
+def _local_model_name(service_url: str) -> str:
+    """Спрашивает у llm_service, какая модель загружена (раньше имя было вписано в код и могло врать).
+
+    Принимает: service_url — адрес llm_service. Возвращает: имя модели или пометку, что сервис не ответил.
+    """
+    import httpx
+
+    try:
+        return httpx.get(f"{service_url}/health", timeout=10).json()["model"] + " (llm_service, 4 бита, do_sample=False)"
+    except (httpx.HTTPError, KeyError, ValueError):
+        return "llm_service не ответил на /health"
+
+
 def run_config(depth: int, diagnostic_comment: bool) -> dict:
     """Всё, что нужно для воспроизведения прогона (раздел 2.4 регламента).
 
@@ -63,8 +84,7 @@ def run_config(depth: int, diagnostic_comment: bool) -> dict:
         "commit": _git("rev-parse", "HEAD").strip(),
         "working_tree_hash": hashlib.sha256(dirty.encode()).hexdigest()[:16] if dirty else "clean",
         "prompts_hash": hashlib.sha256(prompt_text.encode()).hexdigest()[:16],
-        "llm_provider": settings.llm_provider,
-        "llm_model": settings.gigachat_model if settings.llm_provider == "gigachat" else "Qwen3-VL-8B (llm_service, do_sample=False)",
+        "llm_model": _local_model_name(settings.llm_service_url),
         "retrieval_depth": depth,
         "search_by_description": settings.search_by_description,
         "default_linear_lamps_common_areas": settings.default_linear_lamps_common_areas,
@@ -197,7 +217,17 @@ def evaluate_request(estimate: dict, trace: dict, gold: dict) -> dict:
             used.add(related[0])
         works.append({"gold": item["any_of"][0], "outcome": outcome})
     exact_count = sum(w["outcome"] == "exact" for w in works)
+    # Воронка работ (замечание защиты 3 спринта: смотреть, на каком шаге теряется результат).
+    # shown — конкретная работа мастера была среди кандидатов, показанных модели;
+    # chosen_when_shown — из них модель выбрала её (качество выбора отдельно от качества поиска).
+    shown_codes = {item["work_id"] for state in trace.get("findings", {}).values()
+                   for item in state.get("prompt_candidates", [])}
+    specific = [(item, w) for item, w in zip(gold["work_items"], works) if UNIVERSAL not in item["any_of"]]
+    shown = [w for item, w in specific if set(item["any_of"]) & shown_codes]
+    work_funnel = {"n": len(specific), "shown": len(shown),
+                   "chosen_when_shown": sum(w["outcome"] == "exact" for w in shown)}
     # Материалы: материал плана засчитывается первому эталонному материалу, чей шаблон совпал.
+    # Считаются сами по себе, независимо от того, угадана ли работа.
     plan_materials = [line["name"].lower() for line in estimate.get("materials", [])]
     matched_gold, false_materials = set(), []
     for name in plan_materials:
@@ -206,6 +236,19 @@ def evaluate_request(estimate: dict, trace: dict, gold: dict) -> dict:
             false_materials.append(name)
         else:
             matched_gold.add(hit)
+    # Воронка материалов: requested — модель (или чек-лист) запросила материал этого вида;
+    # found — поиск по прайсам вернул подходящий товар; in_plan — товар попал в смету.
+    # Запрос короткий и с другим порядком слов («светодиодная лента» против шаблона «лента.*светодиод»),
+    # поэтому «запрошен» = совпал запрос, или нашёлся товар по запросам, или материал уже в смете.
+    queries = [need.get("query", "").lower() for need in trace.get("material_needs", [])]
+    offered = [c["name"].lower() for found in (trace.get("material_candidates") or {}).values() for c in found]
+    material_funnel = {"n": len(gold["materials"]), "requested": 0, "found": 0, "in_plan": len(matched_gold)}
+    for i, material in enumerate(gold["materials"]):
+        found = i in matched_gold or any(re.search(material["match"], name) for name in offered)
+        material_funnel["found"] += found
+        material_funnel["requested"] += found or any(re.search(material["match"], q) for q in queries)
+    # Недостача: сколько стоят у мастера материалы, которых нет в плане (нехватка хуже лишнего — работа встаёт).
+    missed_rub = sum(_number(m.get("amount")) for i, m in enumerate(gold["materials"]) if i not in matched_gold)
     equipment = " ".join(item.get("name", "") for item in estimate.get("equipment_requirements", [])).lower()
     resources = [{"name": r["name"], "detected": bool(re.search(r["match"], equipment))} for r in gold["additional_resources"]]
     works_total, total = _number(estimate.get("works_total_rub")), _number(estimate.get("total_rub"))
@@ -220,7 +263,10 @@ def evaluate_request(estimate: dict, trace: dict, gold: dict) -> dict:
         "hours": hours,
         "materials": {"tp": len(matched_gold), "fp": len(false_materials), "fn": len(gold["materials"]) - len(matched_gold),
                       "false": false_materials,
-                      "missed": [m["name"] for i, m in enumerate(gold["materials"]) if i not in matched_gold]},
+                      "missed": [m["name"] for i, m in enumerate(gold["materials"]) if i not in matched_gold],
+                      "missed_rub": round(missed_rub, 2), "gold_rub": _number(gold.get("materials_total"))},
+        "work_funnel": work_funnel,
+        "material_funnel": material_funnel,
         "resources": resources,
         "totals": {
             "plan_works": works_total, "actual_works": gold["works_total"],
@@ -248,6 +294,8 @@ def aggregate(per_request: dict[str, dict]) -> dict:
     hours = [h for r in per_request.values() for h in r["hours"]]
     material = {key: sum(r["materials"][key] for r in per_request.values()) for key in ("tp", "fp", "fn")}
     resources = [res for r in per_request.values() for res in r["resources"]]
+    missed_rub = round(sum(r["materials"]["missed_rub"] for r in per_request.values()), 2)
+    gold_rub = round(sum(r["materials"]["gold_rub"] for r in per_request.values()), 2)
 
     def money(plan_key: str, actual_key: str) -> dict:
         """WAPE, смещение и доля заявок в допусках для пары «план — факт»."""
@@ -262,7 +310,17 @@ def aggregate(per_request: dict[str, dict]) -> dict:
         }
         for tolerance in TOLERANCES:
             result[f"within_{tolerance}pct"] = sum(abs(plan / actual - 1) <= tolerance / 100 for plan, actual in pairs)
+        # Вместо одной доли «в ±20 %»: средняя ошибка в рублях, медиана и 90-й перцентиль ошибки в %.
+        errors_pct = sorted(abs(plan / actual - 1) * 100 for plan, actual in pairs)
+        result["mae_rub"] = round(sum(abs(plan - actual) for plan, actual in pairs) / len(pairs), 2) if pairs else None
+        result["median_abs_pct"] = round(statistics.median(errors_pct), 1) if errors_pct else None
+        result["p90_abs_pct"] = round(errors_pct[min(len(errors_pct) - 1, math.ceil(0.9 * len(errors_pct)) - 1)], 1) \
+            if errors_pct else None
         return result
+
+    def funnel(key: str, steps: tuple[str, ...]) -> dict:
+        """Сумма шагов воронки по заявкам (n — сколько позиций мастера всего)."""
+        return {step: sum(r[key][step] for r in per_request.values()) for step in ("n", *steps)}
 
     def errors(items: list[dict]) -> dict:
         """Точное совпадение и MAE количества (n — число точно угаданных работ)."""
@@ -279,7 +337,10 @@ def aggregate(per_request: dict[str, dict]) -> dict:
         "works": {**_f1(work["tp"], work["fp"], work["fn"]), "related": work["related"]},
         "quantity": errors(quantities),
         "hours_1_282": errors(hours),
-        "materials": _f1(material["tp"], material["fp"], material["fn"]),
+        "work_funnel": funnel("work_funnel", ("shown", "chosen_when_shown")),
+        "materials": {**_f1(material["tp"], material["fp"], material["fn"]),
+                      "missed_rub": missed_rub, "gold_rub": gold_rub, "missed_share": _ratio(missed_rub, gold_rub)},
+        "material_funnel": funnel("material_funnel", ("requested", "found", "in_plan")),
         "resources": {"n": len(resources), "detected": sum(r["detected"] for r in resources)},
         "total": money("plan_total", "actual_total"),
         "works_cost": money("plan_works", "actual_works"),
@@ -305,6 +366,18 @@ def evaluate_run(run_dir: Path, gold_path: Path = GOLD_PATH) -> tuple[dict, dict
 
 
 _ROWS = (
+    ("Воронка работ: конкретных у мастера", ("work_funnel", "n")),
+    ("Воронка работ: в кандидатах", ("work_funnel", "shown")),
+    ("Воронка работ: выбрано из бывших в кандидатах", ("work_funnel", "chosen_when_shown")),
+    ("Воронка материалов: у мастера", ("material_funnel", "n")),
+    ("Воронка материалов: запрошено", ("material_funnel", "requested")),
+    ("Воронка материалов: найдено в прайсах", ("material_funnel", "found")),
+    ("Воронка материалов: в смете", ("material_funnel", "in_plan")),
+    ("Материалы: недостача, ₽", ("materials", "missed_rub")),
+    ("Материалы: недостача, доля", ("materials", "missed_share")),
+    ("Полная сумма: средняя ошибка, ₽", ("total", "mae_rub")),
+    ("Полная сумма: медиана ошибки, %", ("total", "median_abs_pct")),
+    ("Полная сумма: 90-й перцентиль ошибки, %", ("total", "p90_abs_pct")),
     ("Recall@6", ("retrieval", "recall_at_6")),
     ("MRR@6", ("retrieval", "mrr_at_6")),
     ("Работы: точность", ("works", "precision")),
@@ -398,8 +471,21 @@ def report(run_dir: Path, baseline_dir: Path | None, exp_id: str | None) -> dict
     return metrics
 
 
+def compare(run_dirs: list[Path]) -> str:
+    """Таблица метрик нескольких прогонов по текущему эталону (в папки прогонов ничего не пишет).
+
+    Принимает: run_dirs — папки прогонов (aNN/estimate.json, trace.json).
+    Возвращает: текст Markdown: строка — метрика, столбец — прогон.
+    """
+    metrics = [evaluate_run(run_dir)[0] for run_dir in run_dirs]
+    names = [run_dir.parent.name if run_dir.name == "primary" else run_dir.name for run_dir in run_dirs]
+    lines = ["| Метрика | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
+    lines += [f"| {label} | " + " | ".join(str(_get(m, path)) for m in metrics) + " |" for label, path in _ROWS]
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Точка входа: run или report."""
+    """Точка входа: run, report или compare."""
     parser = argparse.ArgumentParser(prog="python -m llm.estimator.avr_eval")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("run", help="прогнать 10 заявок АВР")
@@ -409,12 +495,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run", type=Path, required=True)
     p.add_argument("--baseline", type=Path)
     p.add_argument("--id")
+    p = sub.add_parser("compare", help="таблица метрик нескольких прогонов")
+    p.add_argument("runs", type=Path, nargs="+")
     args = parser.parse_args(argv)
     if args.command == "run":
         import logging
 
         logging.basicConfig(level=logging.WARNING, format="%(message)s")
         run(args.out, args.diagnostic_comment)
+    elif args.command == "compare":
+        print(compare(args.runs))
     else:
         metrics = report(args.run, args.baseline, args.id)
         print(json.dumps(metrics, ensure_ascii=False, indent=2))

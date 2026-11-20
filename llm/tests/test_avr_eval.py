@@ -53,3 +53,29 @@ def test_aggregate_money_metrics():
     assert metrics["total"]["bias_pct"] < 0 and metrics["total"]["wape_pct"] > 0
     assert metrics["retrieval"]["recall_at_6"] == 0.5
     assert metrics["total_without_resources"]["within_20pct"] == 0  # 9000 против 617 без техники
+
+
+def test_funnel_and_material_shortage():
+    """Воронка: работа была в кандидатах, но не выбрана; лампу модель запросила и нашла, но в смету не взяла.
+
+    Недостача — стоимость лампы у мастера (200 ₽), доля 1.0.
+    """
+    tr = {"findings": {"f1": {"retrieved": [{"work_id": "2-220"}], "prompt_candidates": [{"work_id": "2-220"}]}},
+          "material_needs": [{"query": "лампа t8 g13"}],
+          "material_candidates": {"m1": [{"name": "Лампа LED T8 G13 18 Вт"}]}}
+    result = evaluate_request(estimate([("2-218", "1")], [], "45", "100"), tr, GOLD)
+    assert result["work_funnel"] == {"n": 1, "shown": 1, "chosen_when_shown": 0}
+    assert result["material_funnel"] == {"n": 1, "requested": 1, "found": 1, "in_plan": 0}
+    assert result["materials"]["missed_rub"] == 200.0
+    metrics = aggregate({"a": result})
+    assert metrics["materials"]["missed_share"] == 1.0
+    assert metrics["material_funnel"]["requested"] == 1
+
+
+def test_error_percentiles():
+    """Средняя ошибка в рублях, медиана и 90-й перцентиль ошибки суммы в %."""
+    exact = evaluate_request(estimate([("2-220", "2")], [], "417", "9617"), trace("2-220"), GOLD)
+    double = evaluate_request(estimate([("2-220", "2")], [], "417", "19234"), trace("2-220"), GOLD)
+    total = aggregate({"a": exact, "b": double})["total"]
+    assert total["mae_rub"] == 4808.5
+    assert total["median_abs_pct"] == 50.0 and total["p90_abs_pct"] == 100.0

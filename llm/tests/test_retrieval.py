@@ -166,3 +166,35 @@ def test_gold_never_reaches_search(tmp_path):
     assert {r["variant"]: r["exact_rank"] for r in records} == {"B0": 2, "B1": 2}
     summary = {row["variant"]: row for row in retrieval_eval.summarize(records)}
     assert summary["B0"]["recall@6"] == 1.0 and summary["B0"]["mrr"] == 0.5
+
+
+
+class PooledRetriever(Retriever):
+    """Поиск-подмена с rerank_texts: общий reranker ставит выше расценку, найденную только по тексту
+    заявки, хотя по оценкам своих запросов она ниже."""
+
+    def __init__(self, results: dict[str, list[str]], common_scores: dict[str, float]):
+        super().__init__(results)
+        self.common_scores, self.rerank_queries = common_scores, []
+
+    def search(self, query: str, top_k: int = 10, **filters):
+        found = super().search(query, top_k, **filters)
+        for hit in found.hits:
+            hit.item.search_text = hit.item.code  # текст для reranker — код, чтобы задать оценки
+        return found
+
+    def rerank_texts(self, query: str, documents: list[str]) -> list[float]:
+        self.rerank_queries.append(query)
+        return [self.common_scores.get(doc, 0.0) for doc in documents]
+
+
+def test_pooled_rerank_uses_one_common_query():
+    """EXP-C1: кандидаты всех запросов дефекта оцениваются одним reranker относительно общего запроса
+    (текст заявки + объект и проблема), а не по несравнимым оценкам своих запросов."""
+    retriever = PooledRetriever({"лампа": ["2-218", "2-219"], "течёт": ["2-152"]},
+                                common_scores={"2-218": 0.2, "2-219": 0.1, "2-152": 0.9})
+    candidates = find_candidates(retriever, observations(), per_finding=2, description="Течёт кран на кухне сильно")
+    assert [c["work_id"] for c in candidates] == ["2-152", "2-218"]
+    assert len(retriever.rerank_queries) == 1 and retriever.rerank_queries[0].startswith("течёт кран на кухне")
+    # Пул собирается без reranker, каждый запрос берёт не меньше 15 расценок.
+    assert all(top_k >= 15 for _, top_k in retriever.queries)

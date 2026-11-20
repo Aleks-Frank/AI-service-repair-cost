@@ -15,7 +15,7 @@
 Эталонный код мастера используется только для подсчёта метрик и в поиск не передаётся.
 
 Запуск (нужны базы и ml_service):
-    python -m llm.estimator.retrieval_eval --traces results/qwen_avr_noauto results/giga_max_avr
+    python -m llm.estimator.retrieval_eval --traces results/qwen_avr_noauto
 Результат: results/retrieval_eval/<время>/report.json и records.jsonl.
 """
 
